@@ -1,11 +1,11 @@
-# Use a modern, slim version of Python as the base image
+#
 FROM python:3.11-slim-bookworm
 
 # Set environment variables for Python to run smoothly
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Set the working directory inside the container
+# 
 WORKDIR /app
 
 # (REMOVED ffmpeg installation as it's not needed for streaming)
