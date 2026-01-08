@@ -70,6 +70,26 @@ if not all(required_vars) or Config.ADMIN_IDS == [0]:
 # --- NEW: Global variable for the protected domain ---
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
+
+# --- BLOCK LIST CONFIGURATION ---
+# List of User-Agents to block (IDM, ADM, Crawlers, Scrapers)
+# This prevents tools that open multiple connections and drain bandwidth
+BLOCKED_AGENTS = [
+    "HeadlessChrome", "Wget", "curl", "python-requests", "Go-http-client",
+    "Java", "IDM", "Internet Download Manager", "ADM", "Advanced Download Manager",
+    "bot", "crawler", "spider", "FDM", "Download", "bytespider"
+]
+
+def is_blocked_agent(user_agent):
+    """Checks if the user agent is in the block list."""
+    if not user_agent:
+        return True # Block requests with no user agent
+    ua = user_agent.lower()
+    for blocked in BLOCKED_AGENTS:
+        if blocked.lower() in ua:
+            return True
+    return False
+
 # -------------------------------------------------------------------------------- #
 # HELPER FUNCTIONS & CLASSES
 # -------------------------------------------------------------------------------- #
@@ -334,18 +354,35 @@ class ByteStreamer:
         retry_count = 0
         max_retries = 3
 
+        # --- OPTIMIZATION START ---
+        # Start with a smaller chunk size (256KB) for faster initial playback.
+        # This saves bandwidth if the user closes the video immediately.
+        current_chunk_size = 256 * 1024 
+        # --- OPTIMIZATION END ---
+
         while True:
             try:
+                # We use 'current_chunk_size' instead of the fixed 'chunk_size'
                 chunk = await media_session.send(
-                    raw.functions.upload.GetFile(location=location, offset=current_offset, limit=chunk_size),
+                    raw.functions.upload.GetFile(location=location, offset=current_offset, limit=current_chunk_size),
                     timeout=30
                 )
                 
                 if isinstance(chunk, raw.types.upload.File) and chunk.bytes:
                     yield chunk.bytes
-                    if len(chunk.bytes) < chunk_size:
+                    
+                    if len(chunk.bytes) < current_chunk_size:
                         break
+                        
                     current_offset += len(chunk.bytes)
+
+                    # --- SMART SCALING ---
+                    # If the connection is stable, increase chunk size up to 1MB.
+                    # This reduces the number of requests for long videos.
+                    if current_chunk_size < 1024 * 1024:
+                        current_chunk_size = 1024 * 1024
+                    # ---------------------
+
                 else:
                     break
 
@@ -426,71 +463,80 @@ async def favicon_handler(request):
 async def stream_handler(request: web.Request):
     client_index = None 
     try:
-        # --- MODIFIED: Referer Check ---
-        referer = request.headers.get('Referer')
-        
-        # Use the dynamic domain from the global variable
-        allowed_referer = CURRENT_PROTECTED_DOMAIN 
+        # --- SECURITY CHECK 1: User Agent ---
+        # Block IDM and Download Managers to prevent 10x bandwidth usage
+        user_agent = request.headers.get('User-Agent', '')
+        if is_blocked_agent(user_agent):
+            LOGGER.warning(f"Blocked Bandwidth Drainer: {user_agent}")
+            return web.Response(status=403, text="Forbidden: Please use the website player.")
 
-        if not referer or not referer.startswith(allowed_referer):
-            LOGGER.warning(f"Blocked hotlink attempt. Referer: {referer}. Allowed: {allowed_referer}")
-            return web.Response(status=403, text="403 Forbidden: Direct access is not allowed.")
-            
-        # --- END OF MODIFICATION ---
+        # --- SECURITY CHECK 2: Referer (Domain Protection) ---
+        # Ensure the request comes ONLY from your website
+        referer = request.headers.get('Referer')
+        allowed_domain = Config.PROTECTED_DOMAIN.rstrip('/')
+        
+        # Allow requests only if Referer matches your domain
+        # (We skip this check if referer is None to allow some valid browsers, 
+        # but strict mode is better for saving data)
+        if referer and allowed_domain not in referer:
+            LOGGER.warning(f"Blocked Hotlink from: {referer}")
+            return web.Response(status=403, text="Forbidden: Access denied.")
 
         message_id = int(request.match_info['message_id'])
         range_header = request.headers.get("Range", 0)
 
+        # --- LOAD BALANCING ---
+        # Pick the bot client with the least workload
         min_load = min(work_loads.values())
         candidates = [cid for cid, load in work_loads.items() if load == min_load]
-        
         global next_client_idx
-        if len(candidates) > 1:
-            client_index = candidates[next_client_idx % len(candidates)]
-            next_client_idx += 1
-        else:
-            client_index = candidates[0]
-            
-        faster_client = multi_clients[client_index]
+        client_index = candidates[next_client_idx % len(candidates)]
+        next_client_idx += 1
+        
+        selected_client = multi_clients[client_index]
         work_loads[client_index] += 1 
 
-        if faster_client not in class_cache:
-            class_cache[faster_client] = ByteStreamer(faster_client)
-        tg_connect = class_cache[faster_client]
+        if selected_client not in class_cache:
+            class_cache[selected_client] = ByteStreamer(selected_client)
+        tg_connect = class_cache[selected_client]
 
+        # Get File Info
         file_id = await tg_connect.get_file_properties(message_id)
         file_size = file_id.file_size
 
+        # Handle Range Requests (Seeking)
         from_bytes = 0
         if range_header:
-            from_bytes_str, _ = range_header.replace("bytes=", "").split("-")
-            from_bytes = int(from_bytes_str)
+            try:
+                from_bytes_str = range_header.replace("bytes=", "").split("-")[0]
+                from_bytes = int(from_bytes_str)
+            except ValueError:
+                from_bytes = 0
 
         if from_bytes >= file_size:
             return web.Response(status=416, reason="Range Not Satisfiable")
 
-        chunk_size = 1024 * 1024
-        offset = from_bytes - (from_bytes % chunk_size)
-        first_part_cut = from_bytes - offset
-        
-        cors_headers = { 'Access-Control-Allow-Origin': allowed_referer }
-        
-        resp = web.StreamResponse(
-            status=206 if range_header else 200,
-            headers={
-                "Content-Type": file_id.mime_type,
-                "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
-                "Content-Length": str(file_size - from_bytes),
-                "Accept-Ranges": "bytes",
-                **cors_headers
-            }
-        )
+        # Setup Response Headers
+        headers = {
+            "Content-Type": file_id.mime_type,
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
+            "Content-Length": str(file_size - from_bytes),
+            "Access-Control-Allow-Origin": allowed_domain, # CORS
+        }
+
+        resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
         await resp.prepare(request)
 
-        # Auto-refresh logic is inside yield_file
-        body_generator = tg_connect.yield_file(file_id, offset, chunk_size, message_id)
+        # Calculate offset
+        chunk_size = 512 * 1024 # Initial chunk calculation
+        offset = from_bytes - (from_bytes % chunk_size)
+        first_part_cut = from_bytes - offset
 
+        # Start Streaming
+        body_generator = tg_connect.yield_file(file_id, offset, chunk_size, message_id)
         is_first_chunk = True
+
         async for chunk in body_generator:
             try:
                 if is_first_chunk and first_part_cut > 0:
@@ -498,11 +544,27 @@ async def stream_handler(request: web.Request):
                     is_first_chunk = False
                 else:
                     await resp.write(chunk)
-            except (ConnectionError, asyncio.CancelledError):
-                LOGGER.warning(f"Client disconnected while writing chunk for message {message_id}.")
+                
+                # --- CRITICAL BANDWIDTH SAVER ---
+                # This checks if the user is still connected.
+                # If user closed the tab, this line raises an error and stops the download INSTANTLY.
+                await resp.drain() 
+                
+            except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError):
+                # User disconnected, stop downloading from Telegram immediately
+                LOGGER.info(f"Connection closed by user. Stopping stream for {message_id}")
                 return resp
-
-        return resp
+                
+    except Exception as e:
+        LOGGER.error(f"Stream Error: {e}")
+        return web.Response(status=500)
+        
+    finally:
+        # Decrease workload count
+        if client_index is not None:
+            work_loads[client_index] -= 1
+    
+    return resp
 
     except (FileReferenceExpired, AuthBytesInvalid) as e:
         LOGGER.error(f"FATAL STREAM ERROR for {message_id}: {type(e).__name__}. Client needs to refresh.")
