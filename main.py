@@ -464,7 +464,7 @@ async def stream_handler(request: web.Request):
     client_index = None 
     try:
         # --- SECURITY CHECK 1: User Agent ---
-        # Block IDM and Download Managers to prevent 10x bandwidth usage
+        # Block IDM and Download Managers to prevent bandwidth drain
         user_agent = request.headers.get('User-Agent', '')
         if is_blocked_agent(user_agent):
             LOGGER.warning(f"Blocked Bandwidth Drainer: {user_agent}")
@@ -475,9 +475,7 @@ async def stream_handler(request: web.Request):
         referer = request.headers.get('Referer')
         allowed_domain = Config.PROTECTED_DOMAIN.rstrip('/')
         
-        # Allow requests only if Referer matches your domain
-        # (We skip this check if referer is None to allow some valid browsers, 
-        # but strict mode is better for saving data)
+        # Block if referer is present but doesn't match our domain
         if referer and allowed_domain not in referer:
             LOGGER.warning(f"Blocked Hotlink from: {referer}")
             return web.Response(status=403, text="Forbidden: Access denied.")
@@ -547,14 +545,19 @@ async def stream_handler(request: web.Request):
                 
                 # --- CRITICAL BANDWIDTH SAVER ---
                 # This checks if the user is still connected.
-                # If user closed the tab, this line raises an error and stops the download INSTANTLY.
                 await resp.drain() 
                 
             except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError):
                 # User disconnected, stop downloading from Telegram immediately
                 LOGGER.info(f"Connection closed by user. Stopping stream for {message_id}")
                 return resp
-                
+    
+    # --- ERROR HANDLING ---
+    # This except block MUST be aligned with the 'try' at the top
+    except (FileReferenceExpired, AuthBytesInvalid) as e:
+        LOGGER.error(f"Stream Link Expired for {message_id}: {e}")
+        return web.Response(status=410, text="Link expired, refresh page.")
+        
     except Exception as e:
         LOGGER.error(f"Stream Error: {e}")
         return web.Response(status=500)
