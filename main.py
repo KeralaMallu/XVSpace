@@ -76,7 +76,7 @@ CHUNK_SIZE_INITIAL = 128 * 1024   # 128KB - Ultra small start (verify user is wa
 CHUNK_SIZE_SMALL = 256 * 1024     # 256KB
 CHUNK_SIZE_MEDIUM = 512 * 1024    # 512KB
 CHUNK_SIZE_LARGE = 1024 * 1024    # 1MB - Maximum
-CHUNK_SCALE_THRESHOLD = 2 * 1024 * 1024  # Scale up after 2MB transferred
+CHUNK_SCALE_THRESHOLD = 1024 * 1024  # Scale up after 2MB transferred
 
 CACHE_TTL = 300
 CACHE_CLEANUP_INTERVAL = 1200
