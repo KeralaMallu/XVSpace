@@ -647,16 +647,7 @@ async def stream_handler(request: web.Request):
                     await resp.write(chunk)
                 
                 # ===== CRITICAL: CHECK CONNECTION EVERY FEW CHUNKS =====
-                chunk_count += 1
-                if chunk_count % 5 == 0:  # Check every 5 chunks
-                    try:
-                        await asyncio.wait_for(resp.drain(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        LOGGER.info(f"Connection timeout detected for {message_id}. Stopping stream.")
-                        return resp
-                    except Exception:
-                        LOGGER.info(f"Connection lost for {message_id}. Stopping stream.")
-                        return resp
+                await resp.drain()
                 
             except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
                 LOGGER.info(f"User disconnected from {message_id}: {type(e).__name__}")
