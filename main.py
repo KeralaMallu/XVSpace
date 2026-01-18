@@ -416,26 +416,39 @@ class ByteStreamer:
             )
 
     async def yield_file(self, file_id: FileId, offset: int, message_id: int):
-        """ULTRA-OPTIMIZED: Adaptive chunking + immediate disconnect detection"""
+        """ULTRA-OPTIMIZED: Fixed Logic for Chrome/Browsers (No 10s cutoff)"""
         media_session = await self.generate_media_session(file_id)
         location = self.get_location(file_id)
 
         current_offset = offset
+        # We need total file size to know when to stop correctly
+        total_file_size = getattr(file_id, "file_size", 0) 
+        
         retry_count = 0
         max_retries = 3
         
-        # Start with ultra-small chunks to verify user is watching
+        # Start with ultra-small chunks
         current_chunk_size = CHUNK_SIZE_INITIAL
         bytes_transferred = 0
-        chunk_count = 0
 
         while True:
             try:
+                # Calculate how much to request. Don't request more than what's left.
+                if total_file_size > 0:
+                    bytes_left = total_file_size - current_offset
+                    if bytes_left <= 0:
+                        break # File finished
+                    
+                    # Request either the chunk size OR whatever is left, whichever is smaller
+                    request_limit = min(current_chunk_size, bytes_left)
+                else:
+                    request_limit = current_chunk_size
+
                 chunk = await media_session.send(
                     raw.functions.upload.GetFile(
                         location=location,
                         offset=current_offset,
-                        limit=current_chunk_size
+                        limit=request_limit
                     ),
                     timeout=30
                 )
@@ -445,18 +458,21 @@ class ByteStreamer:
                     
                     chunk_len = len(chunk.bytes)
                     bytes_transferred += chunk_len
-                    chunk_count += 1
-                    
-                    if chunk_len < current_chunk_size:
-                        break
-                        
                     current_offset += chunk_len
+                    
+                    # 1. STOPPING CONDITION FIX:
+                    # Only break if we received 0 bytes OR if we reached total file size
+                    if chunk_len == 0:
+                        break
+                    if total_file_size > 0 and current_offset >= total_file_size:
+                        break
 
-                    # ADAPTIVE SCALING: Gradually increase chunk size
+                    # 2. ADAPTIVE SCALING:
+                    # Scale up logic
                     if bytes_transferred > CHUNK_SCALE_THRESHOLD:
                         if current_chunk_size < CHUNK_SIZE_LARGE:
                             current_chunk_size = min(CHUNK_SIZE_LARGE, current_chunk_size * 2)
-                    elif bytes_transferred > 1024 * 1024:  # After 1MB
+                    elif bytes_transferred > 1024 * 1024:
                         if current_chunk_size < CHUNK_SIZE_MEDIUM:
                             current_chunk_size = CHUNK_SIZE_MEDIUM
 
@@ -466,15 +482,17 @@ class ByteStreamer:
             except FileReferenceExpired:
                 retry_count += 1
                 if retry_count > max_retries:
-                    raise Exception(f"Max retries exceeded for FileReferenceExpired")
+                    LOGGER.error(f"Max retries exceeded for msg {message_id}")
+                    raise
                 
-                LOGGER.warning(f"FileReferenceExpired for msg {message_id}, retry {retry_count}/{max_retries}")
+                LOGGER.warning(f"FileReferenceExpired for msg {message_id}, refreshing...")
                 
                 original_msg = await self.client.get_messages(Config.LOG_CHANNEL_ID, message_id)
                 if original_msg:
                     refreshed_msg = await forward_file_safely(original_msg)
                     if refreshed_msg:
                         new_file_id = await self.get_file_properties(refreshed_msg.id)
+                        total_file_size = getattr(new_file_id, "file_size", total_file_size)
                         await self.cached_file_ids.put(message_id, new_file_id)
                         
                         post_id = await get_post_id_from_msg_id(message_id)
@@ -483,13 +501,11 @@ class ByteStreamer:
                             if media_doc:
                                 old_qualities = media_doc['message_ids']
                                 quality_key = next((k for k, v in old_qualities.items() if v == message_id), None)
-                                
                                 new_qualities = old_qualities.copy()
                                 if quality_key:
                                     new_qualities[quality_key] = refreshed_msg.id
                                 else:
                                     new_qualities = {k: refreshed_msg.id if v == message_id else v for k, v in old_qualities.items()}
-
                                 await update_media_links_in_db(post_id, new_qualities, media_doc['stream_link'])
                                 
                         location = self.get_location(new_file_id)
