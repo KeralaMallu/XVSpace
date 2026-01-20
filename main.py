@@ -1,4 +1,5 @@
-# main.py - KeralaCaptain Bot - Pure Streaming Engine V4.1 (Modified with caching + disconnect detection)
+# main.py - KeralaCaptain Bot - Pure Streaming Engine V4.1 (Complete with caching, disconnect detection, graceful shutdown)
+
 import os
 import re
 import math
@@ -12,7 +13,7 @@ import aiohttp
 import aiofiles
 import urllib.parse
 import sys
-import psutil # For stats
+import psutil  # For stats
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web, ClientConnectionError, ClientTimeout
@@ -26,7 +27,7 @@ from pyrogram import raw
 from pyrogram.raw.types import InputPhotoFileLocation, InputDocumentFileLocation
 
 # -------------------------------------------------------------------------------- #
-# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Caching + Disconnect Detection)
+# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Final)
 # -------------------------------------------------------------------------------- #
 
 # Load configurations from .env file
@@ -45,21 +46,16 @@ class Config:
     API_ID = int(os.environ.get("API_ID", 0))
     API_HASH = os.environ.get("API_HASH", "")
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-    # REMOVED: BACKUP_BOT_TOKEN (no longer needed)
-    
-    # --- NEW: Admin and Domain Config ---
     ADMIN_IDS = list(int(admin_id) for admin_id in os.environ.get("ADMIN_IDS", "6644681404").split())
     PROTECTED_DOMAIN = os.environ.get("PROTECTED_DOMAIN", "https://www.keralacaptain.shop/").rstrip('/') + '/'
-    
     MONGO_URI = os.environ.get("MONGO_URI", "")
     LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", 0))
     STREAM_URL = os.environ.get("STREAM_URL", "").rstrip('/')
     PORT = int(os.environ.get("PORT", 8080))
-    
     PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 1200))
     ON_HEROKU = 'DYNO' in os.environ
 
-# --- VALIDATE ESSENTIAL CONFIGURATIONS ---
+# Validate essential configurations
 required_vars = [
     Config.API_ID, Config.API_HASH, Config.BOT_TOKEN,
     Config.MONGO_URI, Config.LOG_CHANNEL_ID, Config.STREAM_URL,
@@ -69,27 +65,25 @@ if not all(required_vars) or Config.ADMIN_IDS == [0]:
     LOGGER.critical("FATAL: One or more required variables (API_ID, API_HASH, BOT_TOKEN, MONGO_URI, LOG_CHANNEL_ID, STREAM_URL, ADMIN_IDS) are missing. Cannot start.")
     exit(1)
 
-# --- NEW: Global variable for the protected domain ---
+# Global dynamic domain value (can be updated via admin commands)
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
 # -------------------------------------------------------------------------------- #
-# CACHING / STREAM CONTROL SETTINGS (NEW)
+# CACHING / STREAM CONTROL SETTINGS
 # -------------------------------------------------------------------------------- #
 
 CACHE_DIR = "./cache"
 CACHE_MAX_AGE_SECONDS = 30 * 60       # 30 minutes
 CACHE_CLEAN_INTERVAL = 10 * 60        # 10 minutes
 CHUNK_SIZE = 1024 * 1024              # constant chunk size (1 MiB) - DO NOT change
-TAIL_SLEEP = 0.12                      # sleep while waiting for more bytes during tailing
+TAIL_SLEEP = 0.12                     # sleep while waiting for more bytes during tailing
 
-# Ensure cache dir exists
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Per-message coordination
+# Per-message coordination structures
 cache_locks = {}        # message_id -> asyncio.Lock()
 cache_events = {}       # message_id -> asyncio.Event()  (set when cache fully written)
 cache_writers = {}      # message_id -> bool (True if writer active)
-cache_writer_tasks = {} # message_id -> task (optional)
 
 # Blocklist regex for download managers (case-insensitive)
 DOWNLOAD_AGENT_PATTERNS = re.compile(
@@ -98,10 +92,9 @@ DOWNLOAD_AGENT_PATTERNS = re.compile(
 )
 
 # -------------------------------------------------------------------------------- #
-# HELPER FUNCTIONS & CLASSES (Unchanged logic preserved, new helpers added)
+# HELPER FUNCTIONS & UTILITIES
 # -------------------------------------------------------------------------------- #
 
-# --- Base64 Encoding/Decoding for Stream URLs (Kept for compatibility) ---
 async def encode(string: str) -> str:
     string_bytes = string.encode("ascii")
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
@@ -113,7 +106,6 @@ async def decode(base64_string: str) -> str:
     string_bytes = base64.urlsafe_b64decode(base64_bytes)
     return string_bytes.decode("ascii")
 
-# --- Human-readable formatters (Kept for new stats panel) ---
 def humanbytes(size):
     if not size: return "0 B"
     power = 1024
@@ -125,7 +117,6 @@ def humanbytes(size):
     return f"{round(size, 2)} {power_labels[n]}B"
 
 def get_readable_time(seconds: int) -> str:
-    """Return a human-readable time format"""
     result = ""
     (days, remainder) = divmod(seconds, 86400)
     days = int(days)
@@ -143,149 +134,117 @@ def get_readable_time(seconds: int) -> str:
     result += f"{seconds}s"
     return result
 
-# Safe filename for cache (use message id + original extension)
 def cache_filename_for(message_id: int, original_name: str) -> str:
-    # sanitize extension
     _, ext = os.path.splitext(original_name or "")
     if not ext:
         ext = ".mp4"
     safe_name = f"{message_id}{ext}"
     return os.path.join(CACHE_DIR, safe_name)
 
-# Check UA for download manager clients
 def is_blocked_user_agent(ua: str) -> bool:
     if not ua:
         return False
     return bool(DOWNLOAD_AGENT_PATTERNS.search(ua))
 
 # -------------------------------------------------------------------------------- #
-# DATABASE OPERATIONS (UNCHANGED)
+# DATABASE OPERATIONS
 # -------------------------------------------------------------------------------- #
 
 db_client = AsyncIOMotorClient(Config.MONGO_URI)
 db = db_client['KeralaCaptainBotDB']
 
-# Primary collection for all normal operations (Kept as is)
 media_collection = db['media']
-# Backup collection (Kept as is)
 media_backup_collection = db['media_backup']
-# User conversations (Kept for new settings panel)
 user_conversations_col = db['conversations']
-# --- NEW: Collection for bot settings ---
 settings_collection = db['settings']
 
-# --- Database Functions (Kept original read/write functions for streaming logic) ---
-
 async def check_duplicate(tmdb_id):
-    """Checks for duplicates only in the main collection."""
     return await media_collection.find_one({"tmdb_id": tmdb_id})
 
 async def add_media_to_db(data):
-    """Inserts new media data into both the main and backup collections."""
     await media_collection.insert_one(data)
-    await media_backup_collection.insert_one(data) # Also write to the backup
+    await media_backup_collection.insert_one(data)
 
 async def get_media_by_post_id(post_id: int):
-    """Reads media data only from the main collection for regular use."""
     return await media_collection.find_one({"wp_post_id": post_id})
 
 async def update_media_links_in_db(post_id: int, new_message_ids: dict, new_stream_link: str):
-    """Updates links in both the main and backup collections."""
-    update_query = {
-        "$set": {"message_ids": new_message_ids, "stream_link": new_stream_link}
-    }
+    update_query = {"$set": {"message_ids": new_message_ids, "stream_link": new_stream_link}}
     await media_collection.update_one({"wp_post_id": post_id}, update_query)
-    await media_backup_collection.update_one({"wp_post_id": post_id}, update_query) # Also update the backup
+    await media_backup_collection.update_one({"wp_post_id": post_id}, update_query)
 
 async def delete_media_from_db(post_id: int):
-    """Deletes media data from both the main and backup collections."""
     result_main = await media_collection.delete_one({"wp_post_id": post_id})
-    await media_backup_collection.delete_one({"wp_post_id": post_id}) # Also delete from the backup
+    await media_backup_collection.delete_one({"wp_post_id": post_id})
     return result_main
 
 async def get_stats():
-    """Calculates stats based only on the main collection."""
     movies_count = await media_collection.count_documents({"type": "movie"})
     series_count = await media_collection.count_documents({"type": "series"})
     return movies_count, series_count
 
 async def get_all_media_for_library(page: int = 0, limit: int = 10):
-    """Fetches the library list only from the main collection."""
     cursor = media_collection.find().sort("added_at", -1).skip(page * limit).limit(limit)
     return await cursor.to_list(length=limit)
 
 async def get_user_conversation(chat_id):
-    """Manages user conversation state."""
     return await user_conversations_col.find_one({"_id": chat_id})
 
 async def update_user_conversation(chat_id, data):
-    """Manages user conversation state."""
     if data:
         await user_conversations_col.update_one({"_id": chat_id}, {"$set": data}, upsert=True)
     else:
         await user_conversations_col.delete_one({"_id": chat_id})
 
 async def get_post_id_from_msg_id(msg_id: int):
-    """Helper for stream refreshing. Reads only from the main collection."""
     doc = await media_collection.find_one({"message_ids": {"$in": [msg_id]}})
     return doc['wp_post_id'] if doc else None
 
-# --- NEW: Database functions for Domain Settings (unchanged) ---
-
 async def get_protected_domain() -> str:
-    """Fetches the protected domain from settings, returns default if not found."""
+    global CURRENT_PROTECTED_DOMAIN
     try:
         doc = await settings_collection.find_one({"_id": "bot_settings"})
         if doc and "protected_domain" in doc:
             return doc["protected_domain"]
     except Exception as e:
         LOGGER.error(f"Could not fetch domain from DB: {e}. Using default.")
-    
-    # Fallback to default from Config
     return Config.PROTECTED_DOMAIN
 
 async def set_protected_domain(new_domain: str):
-    """Saves the new protected domain to the database."""
     global CURRENT_PROTECTED_DOMAIN
     if not (new_domain.startswith("https://") or new_domain.startswith("http://")):
         new_domain = "https://" + new_domain
     if not new_domain.endswith('/'):
         new_domain += '/'
-        
-    await settings_collection.update_one(
-        {"_id": "bot_settings"},
-        {"$set": {"protected_domain": new_domain}},
-        upsert=True
-    )
-    CURRENT_PROTECTED_DOMAIN = new_domain # Update global variable
+    await settings_collection.update_one({"_id": "bot_settings"}, {"$set": {"protected_domain": new_domain}}, upsert=True)
+    CURRENT_PROTECTED_DOMAIN = new_domain
     LOGGER.info(f"Protected domain updated in DB: {new_domain}")
     return new_domain
 
 # -------------------------------------------------------------------------------- #
-# STREAMING ENGINE & WEB SERVER (UNCHANGED CORE LOGIC but with caching + drain)
+# STREAMING ENGINE
 # -------------------------------------------------------------------------------- #
 
 multi_clients = {}
 work_loads = {}
 class_cache = {}
-processed_media_groups = {} # Kept for FileReference logic
-next_client_idx = 0 
-stream_errors = 0 
+processed_media_groups = {}
+next_client_idx = 0
+stream_errors = 0
 last_error_reset = time.time()
 
-# Upgraded ByteStreamer (Kept As Is, unchanged except minor logging)
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client: Client = client
-        self.cached_file_ids = {} # Cache for file properties
-        self.session_cache = {} # {dc_id: (session, timestamp)} for TTL
+        self.cached_file_ids = {}
+        self.session_cache = {}
         asyncio.create_task(self.clean_cache_regularly())
 
     async def clean_cache_regularly(self):
         while True:
-            await asyncio.sleep(1200) # 20 min
+            await asyncio.sleep(1200)
             self.cached_file_ids.clear()
-            self.session_cache.clear() 
+            self.session_cache.clear()
             LOGGER.info("Cleared ByteStreamer's cached file properties and sessions.")
 
     async def get_file_properties(self, message_id: int):
@@ -311,21 +270,22 @@ class ByteStreamer:
 
         if dc_id in self.session_cache:
             session, ts = self.session_cache[dc_id]
-            if time.time() - ts < 300: # 5min TTL
+            if time.time() - ts < 300:
                 LOGGER.debug(f"Reusing TTL-cached media session for DC {dc_id}")
                 return session
 
         if media_session:
             try:
                 await media_session.send(raw.functions.help.GetConfig(), timeout=10)
-                self.session_cache[dc_id] = (media_session, time.time()) # Cache on success
+                self.session_cache[dc_id] = (media_session, time.time())
                 LOGGER.debug(f"Reusing pinged media session for DC {dc_id}")
                 return media_session
             except Exception as e:
                 LOGGER.warning(f"Existing media session for DC {dc_id} is stale: {e}. Recreating.")
                 try:
                     await media_session.stop()
-                except: pass
+                except:
+                    pass
                 if dc_id in self.client.media_sessions:
                     del self.client.media_sessions[dc_id]
                 media_session = None
@@ -348,7 +308,7 @@ class ByteStreamer:
             await media_session.start()
 
         self.client.media_sessions[dc_id] = media_session
-        self.session_cache[dc_id] = (media_session, time.time()) # Cache new
+        self.session_cache[dc_id] = (media_session, time.time())
         return media_session
 
     @staticmethod
@@ -359,11 +319,6 @@ class ByteStreamer:
             return InputDocumentFileLocation(id=file_id.media_id, access_hash=file_id.access_hash, file_reference=file_id.file_reference, thumb_size=file_id.thumbnail_size)
 
     async def yield_file(self, file_id: FileId, offset: int, chunk_size: int, message_id: int):
-        """
-        Async generator that yields bytes chunks from Telegram using media session.
-        The logic here is the same as original V4.1; callers must handle cancellation
-        and closing the async generator to stop the download immediately.
-        """
         media_session = await self.generate_media_session(file_id)
         location = self.get_location(file_id)
 
@@ -377,7 +332,7 @@ class ByteStreamer:
                     raw.functions.upload.GetFile(location=location, offset=current_offset, limit=chunk_size),
                     timeout=30
                 )
-                
+
                 if isinstance(chunk, raw.types.upload.File) and chunk.bytes:
                     yield chunk.bytes
                     if len(chunk.bytes) < chunk_size:
@@ -387,42 +342,35 @@ class ByteStreamer:
                     break
 
             except FileReferenceExpired:
-                # This logic is CRUCIAL and why we kept the DB functions
                 retry_count += 1
                 if retry_count > max_retries:
-                    raise 
+                    raise
                 LOGGER.warning(f"FileReferenceExpired for msg {message_id}, retry {retry_count}/{max_retries}. Refreshing...")
-                
+
                 original_msg = await self.client.get_messages(Config.LOG_CHANNEL_ID, message_id)
                 if original_msg:
-                    refreshed_msg = await forward_file_safely(original_msg) # Uses forward_file_safely
+                    refreshed_msg = await forward_file_safely(original_msg)
                     if refreshed_msg:
                         new_file_id = await self.get_file_properties(refreshed_msg.id)
-                        self.cached_file_ids[message_id] = new_file_id 
-                        
-                        # Update DB
-                        post_id = await get_post_id_from_msg_id(message_id) # Uses get_post_id_from_msg_id
+                        self.cached_file_ids[message_id] = new_file_id
+
+                        post_id = await get_post_id_from_msg_id(message_id)
                         if post_id:
-                            media_doc = await get_media_by_post_id(post_id) # Uses get_media_by_post_id
+                            media_doc = await get_media_by_post_id(post_id)
                             if media_doc:
                                 old_qualities = media_doc['message_ids']
-                                # Find the key (quality) for the old message_id
                                 quality_key = next((k for k, v in old_qualities.items() if v == message_id), None)
-                                
                                 new_qualities = old_qualities
                                 if quality_key:
                                     new_qualities[quality_key] = refreshed_msg.id
                                 else:
-                                    # Fallback if key not found (shouldn't happen)
                                     new_qualities = {k: refreshed_msg.id if v == message_id else v for k, v in old_qualities.items()}
-
-                                # Uses update_media_links_in_db
                                 await update_media_links_in_db(post_id, new_qualities, media_doc['stream_link'])
-                                
-                        location = self.get_location(new_file_id) # Recreate location
-                        await asyncio.sleep(2) 
-                        continue # Retry fetch
-                raise # Failed refresh
+
+                        location = self.get_location(new_file_id)
+                        await asyncio.sleep(2)
+                        continue
+                raise
 
             except FloodWait as e:
                 LOGGER.warning(f"FloodWait of {e.value} seconds on get_file. Waiting...")
@@ -430,7 +378,7 @@ class ByteStreamer:
                 continue
 
 # -------------------------------------------------------------------------------- #
-# ROUTES
+# ROUTES & STREAM HANDLER
 # -------------------------------------------------------------------------------- #
 
 routes = web.RouteTableDef()
@@ -442,87 +390,75 @@ async def root_route_handler(request):
 @routes.get("/health")
 async def health_handler(request):
     global stream_errors, last_error_reset
-    if time.time() - last_error_reset > 60: 
+    if time.time() - last_error_reset > 60:
         stream_errors = 0
         last_error_reset = time.time()
     active_sessions = len(multi_clients)
-    cache_size = 0
-    # provide a simple cached files count
+    cache_files_count = 0
     try:
         cache_files = os.listdir(CACHE_DIR)
-        cache_size = len([f for f in cache_files if os.path.isfile(os.path.join(CACHE_DIR, f))])
+        cache_files_count = len([f for f in cache_files if os.path.isfile(os.path.join(CACHE_DIR, f))])
     except Exception:
-        cache_size = 0
+        cache_files_count = 0
     return web.json_response({
         "status": "ok",
         "active_clients": active_sessions,
-        "cache_files": cache_size,
+        "cache_files": cache_files_count,
         "stream_errors_last_min": stream_errors,
         "workloads": work_loads,
     })
 
 @routes.get("/favicon.ico")
 async def favicon_handler(request):
-    return web.Response(status=204) 
+    return web.Response(status=204)
 
 @routes.get(r"/stream/{message_id:\d+}")
 async def stream_handler(request: web.Request):
-    """
-    Main streaming handler.
-    - Blocks download-managers by User-Agent.
-    - Enforces Referer check using CURRENT_PROTECTED_DOMAIN.
-    - Uses disk cache (./cache/) to serve repeated requests without Telegram bandwidth.
-    - If cache missing, first requester downloads from Telegram and writes to disk while streaming.
-    - Calls await resp.drain() after every chunk to detect disconnects and stop Telegram download immediately.
-    """
-    client_index = None 
+    client_index = None
     message_id = None
     try:
-        # --- Referer Check (unchanged logic) ---
         referer = request.headers.get('Referer')
-        allowed_referer = CURRENT_PROTECTED_DOMAIN 
+        allowed_referer = CURRENT_PROTECTED_DOMAIN
 
         if not referer or not referer.startswith(allowed_referer):
             LOGGER.warning(f"Blocked hotlink attempt. Referer: {referer}. Allowed: {allowed_referer}")
             return web.Response(status=403, text="403 Forbidden: Direct access is not allowed.")
-        
-        # --- Block download manager User-Agents ---
+
         ua = request.headers.get("User-Agent", "")
         if is_blocked_user_agent(ua):
             LOGGER.warning(f"Blocked download-manager UA: {ua}")
             return web.Response(status=403, text="403 Forbidden: Download managers are not allowed.")
 
-        # Parse message_id and Range header
         message_id = int(request.match_info['message_id'])
         range_header = request.headers.get("Range", None)
 
-        # --- Client selection / load balancing (unchanged) ---
-        min_load = min(work_loads.values())
-        candidates = [cid for cid, load in work_loads.items() if load == min_load]
-        
+        # Choose client with least load
+        min_load = min(work_loads.values()) if work_loads else 0
+        candidates = [cid for cid, load in work_loads.items() if load == min_load] if work_loads else [0]
+
         global next_client_idx
         if len(candidates) > 1:
             client_index = candidates[next_client_idx % len(candidates)]
             next_client_idx += 1
         else:
             client_index = candidates[0]
-            
+
+        if client_index not in multi_clients:
+            # Fallback to main client index 0
+            client_index = 0
         faster_client = multi_clients[client_index]
-        work_loads[client_index] += 1 
+        work_loads[client_index] = work_loads.get(client_index, 0) + 1
 
         if faster_client not in class_cache:
             class_cache[faster_client] = ByteStreamer(faster_client)
         tg_connect = class_cache[faster_client]
 
-        # Get file properties from Telegram (cached in ByteStreamer)
         file_id = await tg_connect.get_file_properties(message_id)
         file_size = file_id.file_size
         original_name = getattr(file_id, "file_name", f"{message_id}.mp4")
 
-        # Range parsing
         from_bytes = 0
         if range_header:
-            # Example: Range: bytes=12345-
             try:
                 from_bytes_str, _ = range_header.replace("bytes=", "").split("-")
                 from_bytes = int(from_bytes_str) if from_bytes_str else 0
@@ -535,8 +471,7 @@ async def stream_handler(request: web.Request):
         offset = from_bytes - (from_bytes % CHUNK_SIZE)
         first_part_cut = from_bytes - offset
 
-        # Prepare headers (force inline + cache-control as requested)
-        cors_headers = { 'Access-Control-Allow-Origin': allowed_referer }
+        cors_headers = {'Access-Control-Allow-Origin': allowed_referer}
         cd_header = f'inline; filename="{urllib.parse.quote_plus(original_name)}"'
         base_headers = {
             "Content-Type": file_id.mime_type,
@@ -546,7 +481,6 @@ async def stream_handler(request: web.Request):
             **cors_headers
         }
 
-        # Content-Range and Content-Length must be set for partial responses
         content_length = str(file_size - from_bytes)
         if range_header:
             base_headers["Content-Range"] = f"bytes {from_bytes}-{file_size - 1}/{file_size}"
@@ -559,10 +493,8 @@ async def stream_handler(request: web.Request):
         resp = web.StreamResponse(status=status_code, headers=base_headers)
         await resp.prepare(request)
 
-        # Determine cache filename
         cache_path = cache_filename_for(message_id, original_name)
 
-        # Helper: get or create lock/event for this message
         if message_id not in cache_locks:
             cache_locks[message_id] = asyncio.Lock()
         if message_id not in cache_events:
@@ -570,10 +502,9 @@ async def stream_handler(request: web.Request):
         if message_id not in cache_writers:
             cache_writers[message_id] = False
 
-        # If cache exists AND fully written (event set) -> serve directly from disk (fast path)
+        # If cache exists and is marked complete
         if os.path.exists(cache_path) and cache_events[message_id].is_set():
-            LOGGER.info(f"Serving {message_id} from cache (fully available).")
-            # Stream from disk supporting Range reads
+            LOGGER.info(f"Serving {message_id} from cache.")
             async with aiofiles.open(cache_path, mode='rb') as f:
                 await f.seek(from_bytes)
                 bytes_sent = 0
@@ -582,7 +513,6 @@ async def stream_handler(request: web.Request):
                     if not chunk:
                         break
                     try:
-                        # If first chunk and first_part_cut present, slice it
                         if bytes_sent == 0 and first_part_cut > 0:
                             chunk_to_write = chunk[first_part_cut:]
                         else:
@@ -595,10 +525,8 @@ async def stream_handler(request: web.Request):
                         return resp
             return resp
 
-        # If cache file exists but writer is active OR cache doesn't exist, we may need to stream while tailing or create writer
-        # Acquire lock: only one writer should perform Telegram download -> others will tail the file
+        # Attempt to become writer if lock free
         lock = cache_locks[message_id]
-        # If lock is free, current requester will try to become writer; otherwise it will tail-read
         became_writer = False
         if not lock.locked():
             await lock.acquire()
@@ -607,10 +535,8 @@ async def stream_handler(request: web.Request):
             cache_events[message_id].clear()
             LOGGER.info(f"Acquired writer lock for message {message_id}")
         else:
-            # Another writer exists; we will tail-read from disk as it is being written
-            LOGGER.info(f"Another writer is active for {message_id}; tailing from cache file while it's written.")
-        
-        # Writer path: we download from Telegram using yield_file and write to disk + stream to client
+            LOGGER.info(f"Another writer active for {message_id}; tailing from partial cache if available.")
+
         if became_writer:
             body_generator = tg_connect.yield_file(file_id, offset, CHUNK_SIZE, message_id)
             tmp_path = cache_path + ".part"
@@ -620,12 +546,12 @@ async def stream_handler(request: web.Request):
                     bytes_written = 0
                     async for chunk in body_generator:
                         try:
-                            # If first chunk and first_part_cut > 0, write full chunk to disk but slice to client
+                            # write to disk
                             await wf.write(chunk)
                             await wf.flush()
                             bytes_written += len(chunk)
 
-                            # Stream to client (honoring first_part_cut)
+                            # prepare slice for client
                             if is_first_chunk and first_part_cut > 0:
                                 data_for_client = chunk[first_part_cut:]
                                 is_first_chunk = False
@@ -633,17 +559,14 @@ async def stream_handler(request: web.Request):
                                 data_for_client = chunk
 
                             await resp.write(data_for_client)
-                            # CRUCIAL: drain after each write; if this raises, we must stop the Telegram download immediately
                             try:
                                 await resp.drain()
                             except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
-                                LOGGER.warning(f"Detected client disconnect while streaming {message_id}. Cancelling download to save bandwidth. Err: {e}")
-                                # Close/stop the async generator to signal yield_file to stop further Telegram requests
+                                LOGGER.warning(f"Detected client disconnect while streaming {message_id}. Cancelling download. Err: {e}")
                                 try:
                                     await body_generator.aclose()
                                 except Exception:
                                     pass
-                                # Close file and delete partial
                                 try:
                                     await wf.close()
                                 except Exception:
@@ -653,7 +576,6 @@ async def stream_handler(request: web.Request):
                                         os.remove(tmp_path)
                                 except Exception as ex:
                                     LOGGER.warning(f"Failed to remove partial cache {tmp_path}: {ex}")
-                                # Reset writer flags, release lock, notify waiting tailers (they should fail)
                                 cache_writers[message_id] = False
                                 cache_events[message_id].clear()
                                 lock.release()
@@ -661,7 +583,6 @@ async def stream_handler(request: web.Request):
 
                         except Exception as write_err:
                             LOGGER.error(f"Error while writing/streaming chunk for {message_id}: {write_err}", exc_info=True)
-                            # Attempt to stop generator and cleanup
                             try:
                                 await body_generator.aclose()
                             except Exception:
@@ -676,13 +597,17 @@ async def stream_handler(request: web.Request):
                             lock.release()
                             raise write_err
 
-                    # Completed writing full file
-                    # Atomically rename .part -> final cache file
+                try:
+                    # finalize
+                    os.replace(tmp_path, cache_path)
+                except Exception as e:
+                    LOGGER.warning(f"Failed to atomically replace partial cache: {e}")
+                    # fallback: try rename using os.rename
                     try:
-                        await wf.close()
-                    except Exception:
-                        pass
-                os.replace(tmp_path, cache_path)
+                        os.rename(tmp_path, cache_path)
+                    except Exception as e2:
+                        LOGGER.error(f"Failed to move partial cache to final: {e2}")
+
                 cache_events[message_id].set()
                 LOGGER.info(f"Cache written for message {message_id} -> {cache_path}")
                 cache_writers[message_id] = False
@@ -691,7 +616,6 @@ async def stream_handler(request: web.Request):
 
             except Exception as e:
                 LOGGER.error(f"Writer encountered error for message {message_id}: {e}", exc_info=True)
-                # Cleanup
                 try:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
@@ -701,32 +625,24 @@ async def stream_handler(request: web.Request):
                 cache_events[message_id].clear()
                 if lock.locked():
                     lock.release()
-                # Re-raise to be handled by outer except
                 raise
 
         else:
-            # Tail-reading path: cache file might be being created by writer. We open file and read as bytes available.
-            # If file does not yet exist, wait until at least partial appears (but do not wait indefinitely).
+            # Tail-reading path
             tail_start = time.time()
-            max_tail_wait = 30  # seconds, reasonable
+            max_tail_wait = 30
             bytes_sent = 0
             try:
-                # Wait for file to appear (but avoid infinite wait)
                 while not os.path.exists(cache_path):
-                    # If writer aborted (no writer active and no final file), then consider failing
                     if not cache_writers.get(message_id, False) and not os.path.exists(cache_path):
-                        # No writer, and file not present -> try again briefly, then fallback to attempting to be writer
                         await asyncio.sleep(0.15)
-                        # small grace; after waiting a bit, attempt to acquire lock to become writer
                         if not cache_locks[message_id].locked():
-                            # Try to become writer ourselves (race resolution)
                             await cache_locks[message_id].acquire()
                             cache_writers[message_id] = True
                             cache_events[message_id].clear()
                             became_writer = True
                             break
                     if time.time() - tail_start > max_tail_wait:
-                        # fallback: try to become writer if possible
                         if not cache_locks[message_id].locked():
                             await cache_locks[message_id].acquire()
                             cache_writers[message_id] = True
@@ -734,15 +650,11 @@ async def stream_handler(request: web.Request):
                             became_writer = True
                             break
                         else:
-                            # writer exists but file still not created, give up after some time
                             break
                     await asyncio.sleep(0.12)
 
-                # If we became writer due to race, recursively call stream_handler to take writer path
                 if became_writer:
                     LOGGER.info(f"Tail-reader promoted to writer for {message_id}")
-                    # release and re-enter writer logic by calling the handler function again (recur)
-                    # To avoid recursion depth, simply call the writer logic inline: create generator and perform same write-stream cycle
                     body_generator = tg_connect.yield_file(file_id, offset, CHUNK_SIZE, message_id)
                     tmp_path = cache_path + ".part"
                     try:
@@ -807,7 +719,7 @@ async def stream_handler(request: web.Request):
                             cache_locks[message_id].release()
                         raise
 
-                # Normal tailing: file exists and being written by another writer
+                # Normal tailing
                 async with aiofiles.open(cache_path, mode='rb') as rf:
                     await rf.seek(from_bytes)
                     while True:
@@ -825,20 +737,16 @@ async def stream_handler(request: web.Request):
                                 LOGGER.warning(f"Client disconnected while tail-streaming {message_id}: {e}")
                                 return resp
                         else:
-                            # no new data; if writer still active, wait for more, else end
                             if cache_writers.get(message_id, False):
                                 await asyncio.sleep(TAIL_SLEEP)
                                 continue
                             else:
-                                # writer finished but no more bytes
                                 break
 
-                # If we get here we finished tailing
                 return resp
 
             except Exception as e:
                 LOGGER.error(f"Tail-reader failed for message {message_id}: {e}", exc_info=True)
-                # If we held the lock (unlikely here), release
                 try:
                     if cache_locks[message_id].locked():
                         cache_locks[message_id].release()
@@ -855,16 +763,20 @@ async def stream_handler(request: web.Request):
         return web.Response(status=500)
 
     finally:
-        if client_index is not None:
+        if client_index is not None and client_index in work_loads:
             work_loads[client_index] -= 1
             LOGGER.debug(f"Decremented workload for client {client_index}. Current workloads: {work_loads}")
 
+async def web_server():
+    web_app = web.Application(client_max_size=30_000_000)
+    web_app.add_routes(routes)
+    return web_app
+
 # -------------------------------------------------------------------------------- #
-# BOT & CLIENT INITIALIZATION (CLEANED)
+# BOT & CLIENT INITIALIZATION
 # -------------------------------------------------------------------------------- #
 
 main_bot = Client("KeralaCaptainBot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=Config.BOT_TOKEN)
-# REMOVED: backup_bot (no longer needed)
 
 class TokenParser:
     def parse_from_env(self):
@@ -873,8 +785,7 @@ class TokenParser:
 async def initialize_clients():
     multi_clients[0] = main_bot
     work_loads[0] = 0
-    # REMOVED: backup_bot logic (no longer needed)
-    
+
     all_tokens = TokenParser().parse_from_env()
     if not all_tokens:
         LOGGER.info("No additional clients found.")
@@ -891,40 +802,31 @@ async def initialize_clients():
 
     clients = await asyncio.gather(*[start_client(i, token) for i, token in all_tokens.items()])
     multi_clients.update({cid: client for cid, client in clients if client is not None})
-    
+
     if len(multi_clients) > 1:
         LOGGER.info(f"Successfully initialized {len(multi_clients)} clients. Multi-Client mode is ON.")
 
 async def forward_file_safely(message_to_forward: Message):
-    """
-    Sends a file to the log channel using send_cached_media.
-    (Kept for FileReferenceExpired logic)
-    (REMOVED: Backup bot logic)
-    """
     try:
         media = message_to_forward.document or message_to_forward.video
         if not media:
             LOGGER.error("Message has no media to send.")
             return None
-            
         file_id = media.file_id
-            
         LOGGER.info(f"Sending cached media for message {message_to_forward.id} using main bot...")
         return await main_bot.send_cached_media(
             chat_id=Config.LOG_CHANNEL_ID,
             file_id=file_id,
             caption=getattr(message_to_forward, 'caption', '')
         )
-            
     except Exception as e:
         LOGGER.error(f"Main bot failed to send cached media: {e}")
         return None
 
 # -------------------------------------------------------------------------------- #
-# NEW BOT HANDLERS (ADMIN ONLY) - unchanged
+# ADMIN BOT HANDLERS
 # -------------------------------------------------------------------------------- #
 
-# --- NEW: Admin filter ---
 admin_only = filters.user(Config.ADMIN_IDS)
 
 @main_bot.on_message(filters.command("start") & filters.private & admin_only)
@@ -937,17 +839,12 @@ async def start_command(client, message):
             [InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart")]
         ])
     )
-    # Clear any old conversation state
     await update_user_conversation(message.chat.id, None)
 
 @main_bot.on_callback_query(filters.regex("^admin_stats$") & admin_only)
 async def stats_callback(client, cb: CallbackQuery):
     await cb.answer("Fetching stats...")
-    
-    # Uptime
     uptime = get_readable_time(time.time() - start_time)
-    
-    # System Stats
     try:
         cpu_usage = psutil.cpu_percent()
         ram_usage = psutil.virtual_memory().percent
@@ -958,7 +855,6 @@ async def stats_callback(client, cb: CallbackQuery):
         cpu_usage = ram_usage = disk_usage = "N/A"
         ram_total = "N/A"
 
-    # Bot Stats
     active_clients = len(multi_clients)
     workload_str = "\n".join([f"  - Client {cid}: {load} streams" for cid, load in work_loads.items()])
 
@@ -972,7 +868,7 @@ async def stats_callback(client, cb: CallbackQuery):
            f"  - Active Clients: `{active_clients}`\n" \
            f"  - Stream Errors (last min): `{stream_errors}`\n" \
            f"  - Current Workloads:\n{workload_str}"
-           
+
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]])
@@ -981,13 +877,11 @@ async def stats_callback(client, cb: CallbackQuery):
 @main_bot.on_callback_query(filters.regex("^admin_settings$") & admin_only)
 async def settings_callback(client, cb: CallbackQuery):
     await cb.answer()
-    current_domain = await get_protected_domain() # Fetch fresh from DB
-    
+    current_domain = await get_protected_domain()
     text = f"**⚙️ Settings**\n\n" \
            f"**Protected Domain:**\n" \
            f"The bot will only allow streaming requests from this URL (Referer).\n\n" \
            f"Current Value: `{current_domain}`"
-           
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup([
@@ -1024,19 +918,12 @@ async def restart_callback(client, cb: CallbackQuery):
 async def restart_confirm_callback(client, cb: CallbackQuery):
     await cb.answer("Restarting...")
     await cb.message.edit_text("✅ **Restarting...**\n\nBot will be back online shortly.")
-    
-    # --- Real Restart Logic ---
-    # This replaces the current process with a new one
     try:
         LOGGER.info("RESTART triggered by admin.")
-        # Clean up clients before exit
         if main_bot and main_bot.is_connected:
             await main_bot.stop()
-        # REMOVED: backup_bot
     except Exception as e:
         LOGGER.error(f"Error during pre-restart cleanup: {e}")
-    
-    # Execute a new instance of the bot
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 @main_bot.on_callback_query(filters.regex("^(admin_main_menu|admin_cancel_conv)$") & admin_only)
@@ -1057,36 +944,28 @@ async def text_message_handler(client, message: Message):
     chat_id = message.chat.id
     conv = await get_user_conversation(chat_id)
     if not conv: return
-
     stage = conv.get("stage")
-    
+
     if stage == "awaiting_domain":
         new_domain = message.text.strip()
-        
-        # Validate domain (simple check)
         if "." not in new_domain or " " in new_domain:
             return await message.reply_text("Invalid format. Please send a valid domain like `keralacaptain.in`.")
-        
         try:
             status_msg = await message.reply_text("Saving...")
-            saved_domain = await set_protected_domain(new_domain) # This also updates the global var
-            
+            saved_domain = await set_protected_domain(new_domain)
             await status_msg.edit_text(
                 f"✅ **Success!**\n\nProtected domain has been updated to:\n`{saved_domain}`",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Settings", callback_data="admin_settings")]])
             )
-            await update_user_conversation(chat_id, None) # Clear state
-            
+            await update_user_conversation(chat_id, None)
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error!**\nCould not save domain: `{e}`")
 
-
 # -------------------------------------------------------------------------------- #
-# CACHE CLEANER TASK
+# BACKGROUND TASKS
 # -------------------------------------------------------------------------------- #
 
 async def cache_cleaner_loop():
-    """Runs every CACHE_CLEAN_INTERVAL seconds and deletes files older than CACHE_MAX_AGE_SECONDS."""
     while True:
         try:
             now = time.time()
@@ -1097,54 +976,53 @@ async def cache_cleaner_loop():
                         continue
                     mtime = os.path.getmtime(fpath)
                     age = now - mtime
-                    # Remove .part files older than a grace (they indicate failed writes)
                     if fn.endswith(".part"):
-                        if age > 60: # remove partials older than 1 minute
+                        if age > 60:
                             os.remove(fpath)
                             LOGGER.info(f"Removed stale partial cache file: {fpath}")
                         continue
                     if age > CACHE_MAX_AGE_SECONDS:
                         os.remove(fpath)
-                        LOGGER.info(f"Removed cache file older than {CACHE_MAX_AGE_SECONDS}s: {fpath}")
+                        LOGGER.info(f"Removed cache file older than threshold: {fpath}")
                 except Exception as e:
                     LOGGER.warning(f"Error while cleaning cache file {fpath}: {e}")
         except Exception as e:
             LOGGER.error(f"Cache cleaner loop error: {e}", exc_info=True)
         await asyncio.sleep(CACHE_CLEAN_INTERVAL)
 
+async def ping_server():
+    while True:
+        await asyncio.sleep(Config.PING_INTERVAL)
+        try:
+            async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as session:
+                async with session.get(Config.STREAM_URL) as resp:
+                    LOGGER.info(f"Pinged server with status: {resp.status}")
+        except Exception as e:
+            LOGGER.warning(f"Failed to ping server: {e}")
 
- # -------------------------------------------------------------------------------- #
-# APPLICATION LIFECYCLE (REPLACEMENT - robust startup & graceful shutdown)
+# -------------------------------------------------------------------------------- #
+# APPLICATION LIFECYCLE (STARTUP & GRACEFUL SHUTDOWN)
 # -------------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    # Globals referenced by shutdown logic
+    # Global references for cleanup
     runner: web.AppRunner | None = None
     site_obj = None
     cache_cleaner_task = None
     ping_task = None
 
     async def main_startup_shutdown_logic():
-        """
-        Start all services:
-         - Load protected domain from DB
-         - Ensure DB indexes
-         - Start main pyrogram bot
-         - Initialize additional clients
-         - Start background tasks (ping_server, cache_cleaner_loop)
-         - Start aiohttp web server and keep running until shutdown
-        """
         global runner, site_obj, cache_cleaner_task, ping_task, CURRENT_PROTECTED_DOMAIN
 
         LOGGER.info("Application starting up...")
 
-        # --- Fetch protected domain from DB ---
+        # Load protected domain
         try:
             LOGGER.info("Fetching protected domain from database...")
             CURRENT_PROTECTED_DOMAIN = await get_protected_domain()
             LOGGER.info(f"Protected domain loaded: {CURRENT_PROTECTED_DOMAIN}")
         except Exception as e:
-            LOGGER.warning(f"Could not load protected domain from DB: {e}. Using default: {CURRENT_PROTECTED_DOMAIN}")
+            LOGGER.warning(f"Could not load protected domain: {e}")
 
         # Ensure DB indexes
         try:
@@ -1169,13 +1047,13 @@ if __name__ == "__main__":
             LOGGER.critical(f"Failed to start main bot: {e}", exc_info=True)
             raise
 
-        # Initialize additional clients (if any)
+        # Initialize other clients
         try:
             await initialize_clients()
         except Exception as e:
             LOGGER.warning(f"Error initializing additional clients: {e}")
 
-        # Start optional background ping task (Heroku / keepalive)
+        # Start ping task if needed
         if Config.ON_HEROKU:
             try:
                 ping_task = asyncio.create_task(ping_server(), name="ping_server")
@@ -1183,25 +1061,23 @@ if __name__ == "__main__":
             except Exception as e:
                 LOGGER.warning(f"Could not start ping task: {e}")
 
-        # Start cache cleaner background task
+        # Start cache cleaner
         try:
             cache_cleaner_task = asyncio.create_task(cache_cleaner_loop(), name="cache_cleaner_loop")
             LOGGER.info("Started cache_cleaner_loop background task.")
         except Exception as e:
             LOGGER.warning(f"Could not start cache cleaner: {e}")
 
-        # Create and start aiohttp web app
+        # Start web server
         try:
             web_app = await web_server()
             runner = web.AppRunner(web_app)
             await runner.setup()
-            # Bind to 0.0.0.0 on Config.PORT (Render expects to bind to the supplied PORT)
             site_obj = web.TCPSite(runner, "0.0.0.0", Config.PORT)
             await site_obj.start()
             LOGGER.info(f"Web server started on port {Config.PORT}.")
         except Exception as e:
             LOGGER.critical(f"Failed to start web server: {e}", exc_info=True)
-            # If web server fails, we should stop bot and re-raise
             try:
                 if main_bot and main_bot.is_connected:
                     await main_bot.stop()
@@ -1209,31 +1085,26 @@ if __name__ == "__main__":
                 pass
             raise
 
-        # Notify admin that bot is up (best-effort)
+        # Send startup notification (best-effort)
         try:
             await main_bot.send_message(Config.ADMIN_IDS[0], "**✅ Bot has restarted and all services are online!**")
         except Exception as e:
-            LOGGER.debug(f"Could not send startup message to admin: {e}")
+            LOGGER.debug(f"Could not send startup message: {e}")
 
-        # Block here until shutdown signal triggers shutdown handler
-        LOGGER.info("Startup completed. Entering idle wait (service running).")
+        # Block and wait until shutdown handler triggers
+        LOGGER.info("Startup complete. Entering idle state.")
         await asyncio.Event().wait()
 
     async def shutdown_handler(sig):
-        """
-        Graceful shutdown sequence. Called when SIGINT/SIGTERM is received.
-        """
         global runner, site_obj, cache_cleaner_task, ping_task
-
         LOGGER.info(f"Shutdown initiated. Signal: {sig.name if hasattr(sig, 'name') else sig}")
 
-        # 1) Cancel background tasks (ping + cache cleaner)
+        # 1) Cancel background tasks
         tasks_to_cancel = []
         if ping_task is not None and not ping_task.done():
             LOGGER.info("Cancelling ping task...")
             ping_task.cancel()
             tasks_to_cancel.append(ping_task)
-
         if cache_cleaner_task is not None and not cache_cleaner_task.done():
             LOGGER.info("Cancelling cache cleaner task...")
             cache_cleaner_task.cancel()
@@ -1247,7 +1118,7 @@ if __name__ == "__main__":
             except Exception as e:
                 LOGGER.warning(f"Error while cancelling background tasks: {e}")
 
-        # 2) Cleanup web runner (stop accepting new connections, cleanup resources)
+        # 2) Cleanup web runner
         if runner is not None:
             try:
                 LOGGER.info("Cleaning up aiohttp runner...")
@@ -1255,7 +1126,7 @@ if __name__ == "__main__":
             except Exception as e:
                 LOGGER.warning(f"Error during runner.cleanup(): {e}")
 
-        # 3) Stop pyrogram clients (main + any extras)
+        # 3) Stop pyrogram clients
         try:
             LOGGER.info("Stopping pyrogram clients...")
             stop_coros = []
@@ -1274,7 +1145,7 @@ if __name__ == "__main__":
         except Exception as e:
             LOGGER.error(f"Error while stopping pyrogram clients: {e}", exc_info=True)
 
-        # 4) Cancel remaining asyncio tasks (except current)
+        # 4) Cancel remaining tasks
         current = asyncio.current_task()
         remaining = [t for t in asyncio.all_tasks() if t is not current]
         if remaining:
@@ -1289,8 +1160,6 @@ if __name__ == "__main__":
                 LOGGER.debug(f"Issue while awaiting remaining tasks: {e}")
 
         LOGGER.info("Graceful shutdown complete. Stopping event loop.")
-
-        # stop loop (will return control to outer run)
         loop = asyncio.get_event_loop()
         loop.stop()
 
@@ -1302,18 +1171,16 @@ if __name__ == "__main__":
         except NotImplementedError:
             LOGGER.warning("Signal handlers not supported in this environment.")
 
-    # Run main startup and then keep loop running until shutdown_handler stops it
+    # Run startup then wait forever until shutdown_handler stops the loop
     try:
         LOGGER.info("Boot sequence: starting services...")
         loop.run_until_complete(main_startup_shutdown_logic())
-        # run_forever() will be interrupted by loop.stop() in shutdown_handler
         loop.run_forever()
     except KeyboardInterrupt:
         LOGGER.info("KeyboardInterrupt received - shutting down.")
     except Exception as e:
         LOGGER.critical(f"A critical error forced the application to stop: {e}", exc_info=True)
     finally:
-        # Final cleanup: ensure loop has stopped and close if necessary
         try:
             if not loop.is_closed():
                 loop.stop()
