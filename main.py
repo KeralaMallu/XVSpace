@@ -8,9 +8,12 @@ import signal
 import asyncio
 import logging
 import aiohttp
+import hashlib
+import shutil
 import urllib.parse
 import sys
 import psutil
+from pathlib import Path
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web, ClientConnectionError, ClientTimeout
@@ -25,7 +28,8 @@ from pyrogram.raw.types import InputPhotoFileLocation, InputDocumentFileLocation
 from collections import OrderedDict
 
 # ============================================================================ #
-# KeralaCaptain Bot - Ultra-Optimized Streaming Engine V5.0
+# KeralaCaptain Bot - FIXED Production Streaming Engine V6.0
+# Fixes: Variable chunk bug, cache headers, adds disk caching
 # ============================================================================ #
 
 load_dotenv()
@@ -56,6 +60,11 @@ class Config:
     
     PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 1200))
     ON_HEROKU = 'DYNO' in os.environ
+    
+    # Disk cache settings
+    CACHE_DIR = Path("./cache")
+    MAX_CACHE_SIZE_GB = 25  # Use up to 25GB for caching
+    CACHE_CLEANUP_INTERVAL = 1800  # Clean every 30 minutes
 
 required_vars = [
     Config.API_ID, Config.API_HASH, Config.BOT_TOKEN,
@@ -68,24 +77,25 @@ if not all(required_vars) or Config.ADMIN_IDS == [0]:
 
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
+# Create cache directory
+Config.CACHE_DIR.mkdir(exist_ok=True)
+
 # ============================================================================ #
-# BANDWIDTH OPTIMIZATION CONSTANTS
+# FIXED CONSTANTS - NO VARIABLE CHUNK SIZES
 # ============================================================================ #
 
-CHUNK_SIZE_INITIAL = 128 * 1024   # 128KB - Ultra small start (verify user is watching)
-CHUNK_SIZE_SMALL = 256 * 1024     # 256KB
-CHUNK_SIZE_MEDIUM = 512 * 1024    # 512KB
-CHUNK_SIZE_LARGE = 1024 * 1024    # 1MB - Maximum
-CHUNK_SCALE_THRESHOLD = 1024 * 1024  # Scale up after 2MB transferred
+# CRITICAL FIX: Use CONSTANT chunk size - no adaptive/variable sizing
+FIXED_CHUNK_SIZE = 1024 * 1024  # Always 1MB - NEVER CHANGE THIS
+
+# Telegram API limit is 512KB-1MB, we use 1MB as safe maximum
+TELEGRAM_CHUNK_LIMIT = 1024 * 1024  # 1MB - Telegram's max limit
 
 CACHE_TTL = 300
-CACHE_CLEANUP_INTERVAL = 1200
-MAX_CACHE_SIZE = 500  # Reduced for 512MB RAM
-
-DRAIN_CHECK_INTERVAL = 50  # Check connection every 50 chunks
+SESSION_CLEANUP_INTERVAL = 1200
+MAX_MEMORY_CACHE = 200  # Reduced - we're using disk cache now
 
 # ============================================================================ #
-# SECURITY: BLOCKED AGENTS & BROWSERS
+# SECURITY: BLOCKED AGENTS
 # ============================================================================ #
 
 BLOCKED_AGENTS = [
@@ -98,19 +108,17 @@ BLOCKED_AGENTS = [
     "wget", "curl", "python-requests", "go-http-client", "java",
     "bot", "crawler", "spider", "scraper", "bytespider", "headlesschrome",
     
-    # Force Download Browsers (Solo Browser, etc.)
+    # Force Download Browsers
     "solo browser", "uc browser", "opera mini download", "download browser",
     
     # Video Downloaders
     "video download", "videoder", "tubemate", "snaptube", "vidmate"
 ]
 
-REQUIRED_HEADERS = ["range", "user-agent"]  # These headers MUST be present
-
 def is_blocked_agent(user_agent):
-    """Enhanced agent blocking with force-download detection"""
+    """Enhanced agent blocking"""
     if not user_agent:
-        return True
+        return False  # Allow missing user-agent (some mobile players)
     ua = user_agent.lower()
     for blocked in BLOCKED_AGENTS:
         if blocked in ua:
@@ -118,17 +126,16 @@ def is_blocked_agent(user_agent):
     return False
 
 def is_download_request(request):
-    """Detect if browser is forcing a download instead of streaming"""
-    # Check for download-forcing headers
+    """Detect forced downloads"""
     accept = request.headers.get('Accept', '').lower()
     
-    # Legitimate video players send video/* in Accept header
-    if 'video/' not in accept and 'text/html' not in accept and '*/*' not in accept:
-        return True
+    # Allow common video player accept headers
+    if 'video/' in accept or '*/*' in accept or 'text/html' in accept:
+        return False
     
-    # Check if Connection header suggests download tool
+    # Block suspicious patterns
     connection = request.headers.get('Connection', '').lower()
-    if connection == 'close':  # Download managers often use this
+    if connection == 'close' and 'video/' not in accept:
         return True
     
     return False
@@ -175,6 +182,60 @@ def get_readable_time(seconds: int) -> str:
     seconds = int(seconds)
     result += f"{seconds}s"
     return result
+
+def get_cache_path(message_id: int, offset: int) -> Path:
+    """Generate cache file path for a specific chunk"""
+    return Config.CACHE_DIR / f"{message_id}_{offset}.chunk"
+
+def get_cache_size() -> int:
+    """Get total cache directory size in bytes"""
+    total = 0
+    for file in Config.CACHE_DIR.glob("*.chunk"):
+        try:
+            total += file.stat().st_size
+        except:
+            pass
+    return total
+
+async def cleanup_old_cache():
+    """Remove oldest cache files if size exceeds limit"""
+    max_size = Config.MAX_CACHE_SIZE_GB * 1024 * 1024 * 1024  # Convert to bytes
+    current_size = get_cache_size()
+    
+    if current_size <= max_size:
+        return
+    
+    LOGGER.info(f"Cache size {humanbytes(current_size)} exceeds limit. Cleaning...")
+    
+    # Get all cache files sorted by access time (oldest first)
+    cache_files = sorted(
+        Config.CACHE_DIR.glob("*.chunk"),
+        key=lambda p: p.stat().st_atime
+    )
+    
+    # Remove oldest files until we're under the limit
+    for file in cache_files:
+        try:
+            size = file.stat().st_size
+            file.unlink()
+            current_size -= size
+            LOGGER.debug(f"Removed cached chunk: {file.name}")
+            
+            if current_size <= max_size * 0.8:  # Target 80% of max
+                break
+        except Exception as e:
+            LOGGER.warning(f"Failed to remove cache file {file}: {e}")
+    
+    LOGGER.info(f"Cache cleaned. New size: {humanbytes(get_cache_size())}")
+
+async def periodic_cache_cleanup():
+    """Background task to clean cache periodically"""
+    while True:
+        await asyncio.sleep(Config.CACHE_CLEANUP_INTERVAL)
+        try:
+            await cleanup_old_cache()
+        except Exception as e:
+            LOGGER.error(f"Cache cleanup error: {e}")
 
 # ============================================================================ #
 # DATABASE OPERATIONS
@@ -254,11 +315,11 @@ async def set_protected_domain(new_domain: str):
         upsert=True
     )
     CURRENT_PROTECTED_DOMAIN = new_domain
-    LOGGER.info(f"Protected domain updated in DB: {new_domain}")
+    LOGGER.info(f"Protected domain updated: {new_domain}")
     return new_domain
 
 # ============================================================================ #
-# LRU CACHE FOR FILE PROPERTIES
+# LRU CACHE (for file properties only)
 # ============================================================================ #
 
 class LRUCache:
@@ -281,19 +342,14 @@ class LRUCache:
             self.cache[key] = value
             if len(self.cache) > self.capacity:
                 self.cache.popitem(last=False)
-    
-    async def clear(self):
-        async with self.lock:
-            self.cache.clear()
 
 # ============================================================================ #
-# ULTRA-OPTIMIZED BYTE STREAMER
+# FIXED BYTE STREAMER WITH DISK CACHE
 # ============================================================================ #
 
 multi_clients = {}
 work_loads = {}
 class_cache = {}
-processed_media_groups = {}
 next_client_idx = 0
 stream_errors = 0
 last_error_reset = time.time()
@@ -301,14 +357,14 @@ last_error_reset = time.time()
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client: Client = client
-        self.cached_file_ids = LRUCache(MAX_CACHE_SIZE)
+        self.cached_file_ids = LRUCache(MAX_MEMORY_CACHE)
         self.session_cache = {}
         asyncio.create_task(self.clean_stale_sessions())
 
     async def clean_stale_sessions(self):
-        """Only clean stale sessions, keep active ones"""
+        """Clean stale sessions periodically"""
         while True:
-            await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
+            await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
             current_time = time.time()
             stale = [
                 dc_id for dc_id, (_, ts) in self.session_cache.items()
@@ -322,7 +378,8 @@ class ByteStreamer:
                     pass
                 del self.session_cache[dc_id]
             
-            LOGGER.info(f"Cleaned {len(stale)} stale sessions. Active: {len(self.session_cache)}")
+            if stale:
+                LOGGER.info(f"Cleaned {len(stale)} stale sessions")
 
     async def get_file_properties(self, message_id: int):
         cached = await self.cached_file_ids.get(message_id)
@@ -357,7 +414,7 @@ class ByteStreamer:
                 self.session_cache[dc_id] = (media_session, time.time())
                 return media_session
             except Exception as e:
-                LOGGER.warning(f"Stale session for DC {dc_id}: {e}. Recreating.")
+                LOGGER.warning(f"Stale session DC {dc_id}, recreating")
                 try:
                     await media_session.stop()
                 except:
@@ -366,7 +423,7 @@ class ByteStreamer:
                     del self.client.media_sessions[dc_id]
                 media_session = None
 
-        LOGGER.info(f"Creating new media session for DC {dc_id}")
+        LOGGER.info(f"Creating media session for DC {dc_id}")
         if dc_id != await self.client.storage.dc_id():
             media_session = Session(
                 self.client, dc_id,
@@ -381,7 +438,7 @@ class ByteStreamer:
                     await media_session.send(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
                     break
                 except AuthBytesInvalid as e:
-                    LOGGER.warning(f"AuthBytesInvalid attempt {i+1}: {e}")
+                    LOGGER.warning(f"AuthBytesInvalid attempt {i+1}")
                     if i == 2:
                         raise
                     await asyncio.sleep(1)
@@ -416,76 +473,100 @@ class ByteStreamer:
             )
 
     async def yield_file(self, file_id: FileId, offset: int, message_id: int):
-        """ULTRA-OPTIMIZED: Fixed Logic for Chrome/Browsers (No 10s cutoff)"""
+        """
+        CRITICAL FIX: 
+        - Use FIXED 1MB chunks (no variable sizing)
+        - Implement disk caching
+        - Proper stopping conditions
+        """
         media_session = await self.generate_media_session(file_id)
         location = self.get_location(file_id)
 
         current_offset = offset
-        # We need total file size to know when to stop correctly
-        total_file_size = getattr(file_id, "file_size", 0) 
+        total_file_size = getattr(file_id, "file_size", 0)
         
         retry_count = 0
         max_retries = 3
-        
-        # Start with ultra-small chunks
-        current_chunk_size = CHUNK_SIZE_INITIAL
-        bytes_transferred = 0
 
         while True:
-            try:
-                # Calculate how much to request. Don't request more than what's left.
-                if total_file_size > 0:
-                    bytes_left = total_file_size - current_offset
-                    if bytes_left <= 0:
-                        break # File finished
-                    
-                    # Request either the chunk size OR whatever is left, whichever is smaller
-                    request_limit = min(current_chunk_size, bytes_left)
-                else:
-                    request_limit = current_chunk_size
+            # Calculate bytes remaining
+            if total_file_size > 0:
+                bytes_remaining = total_file_size - current_offset
+                if bytes_remaining <= 0:
+                    LOGGER.debug(f"[{message_id}] Reached end of file")
+                    break
+                
+                # FIXED: Use constant chunk size, but don't exceed file size
+                request_limit = min(FIXED_CHUNK_SIZE, bytes_remaining)
+            else:
+                request_limit = FIXED_CHUNK_SIZE
 
+            # Check disk cache first
+            cache_path = get_cache_path(message_id, current_offset)
+            
+            if cache_path.exists():
+                # Serve from disk cache (ZERO bandwidth!)
+                try:
+                    with open(cache_path, 'rb') as f:
+                        chunk_bytes = f.read()
+                    
+                    if chunk_bytes:
+                        LOGGER.debug(f"[{message_id}] Serving from cache: offset {current_offset}")
+                        yield chunk_bytes
+                        current_offset += len(chunk_bytes)
+                        
+                        # Update access time for LRU cleanup
+                        cache_path.touch()
+                        continue
+                except Exception as e:
+                    LOGGER.warning(f"Cache read error: {e}, fetching from Telegram")
+                    # Fall through to Telegram fetch
+
+            # Fetch from Telegram
+            try:
                 chunk = await media_session.send(
                     raw.functions.upload.GetFile(
                         location=location,
                         offset=current_offset,
-                        limit=request_limit
+                        limit=request_limit  # Always 1MB or less
                     ),
                     timeout=30
                 )
                 
                 if isinstance(chunk, raw.types.upload.File) and chunk.bytes:
-                    yield chunk.bytes
+                    chunk_bytes = chunk.bytes
+                    chunk_len = len(chunk_bytes)
                     
-                    chunk_len = len(chunk.bytes)
-                    bytes_transferred += chunk_len
+                    # Save to disk cache asynchronously
+                    try:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(cache_path, 'wb') as f:
+                            f.write(chunk_bytes)
+                        LOGGER.debug(f"[{message_id}] Cached chunk at offset {current_offset}")
+                    except Exception as e:
+                        LOGGER.warning(f"Cache write error: {e}")
+                    
+                    # Yield to client
+                    yield chunk_bytes
                     current_offset += chunk_len
                     
-                    # 1. STOPPING CONDITION FIX:
-                    # Only break if we received 0 bytes OR if we reached total file size
-                    if chunk_len == 0:
+                    # FIXED STOPPING CONDITION: Check if we got less than requested
+                    # This means we've reached the end
+                    if chunk_len < request_limit:
+                        LOGGER.debug(f"[{message_id}] Received partial chunk, end of file")
                         break
-                    if total_file_size > 0 and current_offset >= total_file_size:
-                        break
-
-                    # 2. ADAPTIVE SCALING:
-                    # Scale up logic
-                    if bytes_transferred > CHUNK_SCALE_THRESHOLD:
-                        if current_chunk_size < CHUNK_SIZE_LARGE:
-                            current_chunk_size = min(CHUNK_SIZE_LARGE, current_chunk_size * 2)
-                    elif bytes_transferred > 1024 * 1024:
-                        if current_chunk_size < CHUNK_SIZE_MEDIUM:
-                            current_chunk_size = CHUNK_SIZE_MEDIUM
-
+                        
                 else:
+                    # No more data
                     break
 
             except FileReferenceExpired:
                 retry_count += 1
                 if retry_count > max_retries:
-                    LOGGER.error(f"Max retries exceeded for msg {message_id}")
+                    LOGGER.error(f"[{message_id}] Max retries exceeded")
                     raise
                 
-                LOGGER.warning(f"FileReferenceExpired for msg {message_id}, refreshing...")
+                LOGGER.warning(f"[{message_id}] FileReferenceExpired, refreshing...")
                 
                 original_msg = await self.client.get_messages(Config.LOG_CHANNEL_ID, message_id)
                 if original_msg:
@@ -507,16 +588,28 @@ class ByteStreamer:
                                 else:
                                     new_qualities = {k: refreshed_msg.id if v == message_id else v for k, v in old_qualities.items()}
                                 await update_media_links_in_db(post_id, new_qualities, media_doc['stream_link'])
-                                
+                        
+                        # Clear cache for this file (reference is stale)
+                        for old_cache in Config.CACHE_DIR.glob(f"{message_id}_*.chunk"):
+                            try:
+                                old_cache.unlink()
+                            except:
+                                pass
+                        
                         location = self.get_location(new_file_id)
                         await asyncio.sleep(2)
                         continue
                 raise
 
             except FloodWait as e:
-                LOGGER.warning(f"FloodWait {e.value}s. Waiting...")
+                LOGGER.warning(f"FloodWait {e.value}s")
                 await asyncio.sleep(e.value)
                 continue
+            
+            except LimitInvalid:
+                # This should never happen with FIXED_CHUNK_SIZE, but just in case
+                LOGGER.error(f"[{message_id}] LimitInvalid error - chunk size issue")
+                raise
 
 # ============================================================================ #
 # WEB SERVER ROUTES
@@ -526,7 +619,7 @@ routes = web.RouteTableDef()
 
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
-    return web.Response(text="KeralaCaptain Streaming Service", content_type='text/html')
+    return web.Response(text="KeralaCaptain Streaming Service V6.0", content_type='text/html')
 
 @routes.get("/health")
 async def health_handler(request):
@@ -535,20 +628,15 @@ async def health_handler(request):
         stream_errors = 0
         last_error_reset = time.time()
     
-    active_sessions = len(multi_clients)
-    cache_size = 0
-    if multi_clients:
-        sample_client = list(multi_clients.values())[0]
-        if sample_client in class_cache:
-            streamer = class_cache[sample_client]
-            cache_size = len(streamer.cached_file_ids.cache) if hasattr(streamer.cached_file_ids, 'cache') else 0
+    cache_size = get_cache_size()
     
     return web.json_response({
         "status": "ok",
-        "active_clients": active_sessions,
-        "cache_size": cache_size,
+        "active_clients": len(multi_clients),
         "stream_errors_last_min": stream_errors,
         "workloads": work_loads,
+        "disk_cache_size": humanbytes(cache_size),
+        "disk_cache_files": len(list(Config.CACHE_DIR.glob("*.chunk")))
     })
 
 @routes.get("/favicon.ico")
@@ -565,30 +653,22 @@ async def stream_handler(request: web.Request):
         user_agent = request.headers.get('User-Agent', '')
         if is_blocked_agent(user_agent):
             LOGGER.warning(f"BLOCKED Agent: {user_agent[:100]}")
-            return web.Response(status=403, text="Access denied. Please use the website player.")
+            return web.Response(status=403, text="Access denied")
 
         # ===== SECURITY LAYER 2: DOWNLOAD DETECTION =====
         if is_download_request(request):
-            LOGGER.warning(f"BLOCKED Download attempt from: {user_agent[:100]}")
-            return web.Response(status=403, text="Downloads not allowed. Stream only.")
+            LOGGER.warning(f"BLOCKED Download: {user_agent[:100]}")
+            return web.Response(status=403, text="Downloads not allowed")
 
-        # ===== SECURITY LAYER 3: REFERER CHECK =====
+        # ===== SECURITY LAYER 3: REFERER CHECK (Relaxed for mobile) =====
         referer = request.headers.get('Referer', '')
         allowed_domain = CURRENT_PROTECTED_DOMAIN.rstrip('/')
         
-        # STRICT: Must have referer AND it must match our domain
-        if not referer or allowed_domain not in referer:
+        # FIXED: Allow requests with no referer (mobile in-app browsers)
+        # But if referer exists, it must match our domain
+        if referer and allowed_domain not in referer:
             LOGGER.warning(f"BLOCKED - Invalid referer: {referer}")
-            return web.Response(
-                status=403,
-                text="Access denied. This stream can only be accessed from the official website."
-            )
-
-        # ===== SECURITY LAYER 4: REQUIRED HEADERS =====
-        for required_header in REQUIRED_HEADERS:
-            if required_header not in request.headers:
-                LOGGER.warning(f"BLOCKED - Missing header: {required_header}")
-                return web.Response(status=400, text="Bad request")
+            return web.Response(status=403, text="Access denied")
 
         message_id = int(request.match_info['message_id'])
         range_header = request.headers.get("Range", 0)
@@ -623,19 +703,20 @@ async def stream_handler(request: web.Request):
         if from_bytes >= file_size:
             return web.Response(status=416, reason="Range Not Satisfiable")
 
-        # ===== ANTI-DOWNLOAD HEADERS =====
+        # ===== FIXED HEADERS (Allow buffering) =====
         headers = {
             "Content-Type": file_id.mime_type,
             "Accept-Ranges": "bytes",
             "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
             "Content-Length": str(file_size - from_bytes),
-            "Content-Disposition": "inline",  # Force inline (no download)
+            "Content-Disposition": "inline",  # Force streaming
             "X-Content-Type-Options": "nosniff",
-            "Access-Control-Allow-Origin": allowed_domain,
+            "Access-Control-Allow-Origin": "*",  # Allow all origins for CORS
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Range, User-Agent",
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache"
+            # CRITICAL FIX: Allow browser caching for smooth buffering
+            "Cache-Control": "private, max-age=3600",
+            "Pragma": "public"  # Enable caching
         }
 
         resp = web.StreamResponse(
@@ -644,15 +725,13 @@ async def stream_handler(request: web.Request):
         )
         await resp.prepare(request)
 
-        # ===== CALCULATE OFFSET =====
-        chunk_size = CHUNK_SIZE_INITIAL
-        offset = from_bytes - (from_bytes % chunk_size)
+        # ===== CALCULATE OFFSET (aligned to chunk size) =====
+        offset = from_bytes - (from_bytes % FIXED_CHUNK_SIZE)
         first_part_cut = from_bytes - offset
 
-        # ===== START STREAMING WITH AGGRESSIVE DISCONNECT DETECTION =====
+        # ===== START STREAMING =====
         body_generator = tg_connect.yield_file(file_id, offset, message_id)
         is_first_chunk = True
-        chunk_count = 0
 
         async for chunk in body_generator:
             try:
@@ -662,31 +741,31 @@ async def stream_handler(request: web.Request):
                 else:
                     await resp.write(chunk)
                 
-                # ===== CRITICAL: CHECK CONNECTION EVERY FEW CHUNKS =====
+                # Drain periodically to detect disconnects
                 await resp.drain()
                 
             except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
-                LOGGER.info(f"User disconnected from {message_id}: {type(e).__name__}")
+                LOGGER.info(f"[{message_id}] User disconnected: {type(e).__name__}")
                 return resp
             except Exception as e:
-                LOGGER.error(f"Write error for {message_id}: {e}")
+                LOGGER.error(f"[{message_id}] Write error: {e}")
                 return resp
 
         return resp
 
     except (FileReferenceExpired, AuthBytesInvalid) as e:
         stream_errors += 1
-        LOGGER.error(f"Stream expired for {message_id}: {type(e).__name__}")
-        return web.Response(status=410, text="Stream expired. Please refresh the page.")
+        LOGGER.error(f"[{message_id}] Stream expired: {type(e).__name__}")
+        return web.Response(status=410, text="Stream expired. Refresh page.")
 
-    except FileNotFoundError as e:
-        LOGGER.error(f"File not found: {message_id}")
+    except FileNotFoundError:
+        LOGGER.error(f"[{message_id}] File not found")
         return web.Response(status=404, text="Media not found")
 
     except Exception as e:
         stream_errors += 1
-        LOGGER.critical(f"Unhandled stream error for {message_id}: {e}", exc_info=True)
-        return web.Response(status=500, text="Internal server error")
+        LOGGER.critical(f"[{message_id}] Unhandled error: {e}", exc_info=True)
+        return web.Response(status=500, text="Internal error")
 
     finally:
         if client_index is not None:
@@ -722,7 +801,7 @@ async def initialize_clients():
     
     all_tokens = TokenParser().parse_from_env()
     if not all_tokens:
-        LOGGER.info("No additional clients found. Running in single-client mode.")
+        LOGGER.info("Single-client mode")
         return
 
     async def start_client(client_id, token):
@@ -738,32 +817,28 @@ async def initialize_clients():
             work_loads[client_id] = 0
             return client_id, client
         except Exception as e:
-            LOGGER.error(f"Failed to start Client {client_id}: {e}")
+            LOGGER.error(f"Failed to start client {client_id}: {e}")
             return None
 
     clients = await asyncio.gather(*[start_client(i, token) for i, token in all_tokens.items()])
     multi_clients.update({cid: client for cid, client in clients if client is not None})
     
     if len(multi_clients) > 1:
-        LOGGER.info(f"Multi-client mode enabled: {len(multi_clients)} clients active")
+        LOGGER.info(f"Multi-client mode: {len(multi_clients)} clients")
 
 async def forward_file_safely(message_to_forward: Message):
-    """Sends file to log channel using cached media"""
+    """Refresh expired file reference"""
     try:
         media = message_to_forward.document or message_to_forward.video
         if not media:
-            LOGGER.error("Message has no media to forward")
             return None
             
         file_id = media.file_id
-            
-        LOGGER.info(f"Forwarding cached media for message {message_to_forward.id}...")
         return await main_bot.send_cached_media(
             chat_id=Config.LOG_CHANNEL_ID,
             file_id=file_id,
             caption=getattr(message_to_forward, 'caption', '')
         )
-            
     except Exception as e:
         LOGGER.error(f"Failed to forward media: {e}", exc_info=True)
         return None
@@ -777,59 +852,57 @@ admin_only = filters.user(Config.ADMIN_IDS)
 @main_bot.on_message(filters.command("start") & filters.private & admin_only)
 async def start_command(client, message):
     await message.reply_text(
-        "**👋 Welcome, Admin!**\n\n"
-        "This is your streaming bot's control panel.\n"
+        "**👋 Admin Control Panel**\n\n"
+        "Bot Version: 6.0 (FIXED)\n"
         "What would you like to do?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart")]
+            [InlineKeyboardButton("🗑️ Clear Cache", callback_data="admin_clear_cache")],
+            [InlineKeyboardButton("🔄 Restart", callback_data="admin_restart")]
         ])
     )
     await update_user_conversation(message.chat.id, None)
 
 @main_bot.on_callback_query(filters.regex("^admin_stats$") & admin_only)
 async def stats_callback(client, cb: CallbackQuery):
-    await cb.answer("Fetching stats...")
+    await cb.answer("Fetching...")
     
     uptime = get_readable_time(time.time() - start_time)
     
     try:
-        cpu_usage = psutil.cpu_percent(interval=1)
+        cpu = psutil.cpu_percent(interval=1)
         ram = psutil.virtual_memory()
-        ram_usage = ram.percent
-        ram_used = humanbytes(ram.used)
-        ram_total = humanbytes(ram.total)
         disk = psutil.disk_usage('/')
-        disk_usage = disk.percent
-        disk_used = humanbytes(disk.used)
-        disk_total = humanbytes(disk.total)
-    except Exception as e:
-        LOGGER.warning(f"Could not fetch system stats: {e}")
-        cpu_usage = ram_usage = disk_usage = "N/A"
-        ram_used = ram_total = disk_used = disk_total = "N/A"
+    except:
+        cpu = ram = disk = None
 
-    active_clients = len(multi_clients)
-    workload_str = "\n".join([f"  - Client {cid}: {load} active streams" for cid, load in work_loads.items()])
+    cache_size = get_cache_size()
+    cache_files = len(list(Config.CACHE_DIR.glob("*.chunk")))
     
     movies, series = await get_stats()
 
-    text = (
-        f"**📊 Bot Statistics**\n\n"
-        f"**⏱ Uptime:** `{uptime}`\n\n"
-        f"**💾 System Resources:**\n"
-        f"  • CPU: `{cpu_usage}%`\n"
-        f"  • RAM: `{ram_usage}%` ({ram_used} / {ram_total})\n"
-        f"  • Disk: `{disk_usage}%` ({disk_used} / {disk_total})\n\n"
-        f"**📡 Streaming:**\n"
-        f"  • Active Clients: `{active_clients}`\n"
-        f"  • Stream Errors (last min): `{stream_errors}`\n"
-        f"  • Workloads:\n{workload_str}\n\n"
-        f"**📚 Database:**\n"
-        f"  • Movies: `{movies}`\n"
-        f"  • Series: `{series}`\n"
-        f"  • Total: `{movies + series}`"
-    )
+    if cpu:
+        text = (
+            f"**📊 Bot Statistics**\n\n"
+            f"**⏱ Uptime:** `{uptime}`\n\n"
+            f"**💾 System:**\n"
+            f"  • CPU: `{cpu}%`\n"
+            f"  • RAM: `{ram.percent}%` ({humanbytes(ram.used)}/{humanbytes(ram.total)})\n"
+            f"  • Disk: `{disk.percent}%` ({humanbytes(disk.used)}/{humanbytes(disk.total)})\n\n"
+            f"**💿 Disk Cache:**\n"
+            f"  • Size: `{humanbytes(cache_size)}`\n"
+            f"  • Files: `{cache_files}` chunks\n"
+            f"  • Limit: `{Config.MAX_CACHE_SIZE_GB}GB`\n\n"
+            f"**📡 Streaming:**\n"
+            f"  • Clients: `{len(multi_clients)}`\n"
+            f"  • Errors: `{stream_errors}`\n\n"
+            f"**📚 Database:**\n"
+            f"  • Movies: `{movies}`\n"
+            f"  • Series: `{series}`"
+        )
+    else:
+        text = f"**📊 Statistics**\n\nUptime: `{uptime}`\nCache: `{humanbytes(cache_size)}`"
            
     await cb.message.edit_text(
         text,
@@ -845,17 +918,14 @@ async def settings_callback(client, cb: CallbackQuery):
     current_domain = await get_protected_domain()
     
     text = (
-        f"**⚙️ Bot Settings**\n\n"
-        f"**🔒 Protected Domain:**\n"
-        f"Streams will ONLY work when accessed from this domain.\n"
-        f"This prevents hotlinking and unauthorized access.\n\n"
-        f"**Current Value:**\n`{current_domain}`\n\n"
-        f"**Security Features Active:**\n"
-        f"✅ User-Agent blocking (IDM/ADM blocked)\n"
-        f"✅ Download prevention (force inline streaming)\n"
+        f"**⚙️ Settings**\n\n"
+        f"**Protected Domain:**\n`{current_domain}`\n\n"
+        f"**Security:**\n"
+        f"✅ Agent blocking\n"
+        f"✅ Download prevention\n"
         f"✅ Referer validation\n"
-        f"✅ Adaptive bandwidth optimization\n"
-        f"✅ Connection monitoring"
+        f"✅ Fixed 1MB chunks\n"
+        f"✅ Disk caching enabled"
     )
            
     await cb.message.edit_text(
@@ -866,18 +936,35 @@ async def settings_callback(client, cb: CallbackQuery):
         ])
     )
 
+@main_bot.on_callback_query(filters.regex("^admin_clear_cache$") & admin_only)
+async def clear_cache_callback(client, cb: CallbackQuery):
+    await cb.answer("Clearing cache...")
+    
+    try:
+        count = 0
+        for file in Config.CACHE_DIR.glob("*.chunk"):
+            file.unlink()
+            count += 1
+        
+        await cb.message.edit_text(
+            f"✅ **Cache Cleared**\n\n"
+            f"Removed `{count}` cached chunks.\n"
+            f"New cache size: `{humanbytes(get_cache_size())}`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]
+            ])
+        )
+    except Exception as e:
+        await cb.message.edit_text(f"❌ Error: {e}")
+
 @main_bot.on_callback_query(filters.regex("^admin_set_domain$") & admin_only)
 async def set_domain_callback(client, cb: CallbackQuery):
     await cb.answer()
     await update_user_conversation(cb.message.chat.id, {"stage": "awaiting_domain"})
     await cb.message.edit_text(
-        "**✏️ Set New Protected Domain**\n\n"
-        "Send the new domain URL that should be allowed to access streams.\n\n"
-        "**Examples:**\n"
-        "• `https://keralacaptain.shop`\n"
-        "• `keralacaptain.shop`\n"
-        "• `www.keralacaptain.shop`\n\n"
-        "⚠️ **Important:** Only requests from this domain will be able to stream videos.",
+        "**✏️ Set Protected Domain**\n\n"
+        "Send new domain:\n"
+        "Example: `keralacaptain.shop`",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_conv")]
         ])
@@ -887,35 +974,27 @@ async def set_domain_callback(client, cb: CallbackQuery):
 async def restart_callback(client, cb: CallbackQuery):
     await cb.answer()
     await cb.message.edit_text(
-        "**⚠️ Restart Confirmation**\n\n"
-        "This will restart the entire bot process.\n"
-        "All active streams will be disconnected.\n\n"
-        "**Are you sure?**",
+        "**⚠️ Restart?**\n\n"
+        "All active streams will disconnect.",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Yes, Restart", callback_data="admin_restart_confirm"),
-                InlineKeyboardButton("❌ No, Cancel", callback_data="admin_main_menu")
+                InlineKeyboardButton("✅ Yes", callback_data="admin_restart_confirm"),
+                InlineKeyboardButton("❌ No", callback_data="admin_main_menu")
             ]
         ])
     )
 
 @main_bot.on_callback_query(filters.regex("^admin_restart_confirm$") & admin_only)
 async def restart_confirm_callback(client, cb: CallbackQuery):
-    await cb.answer("Restarting bot...")
-    await cb.message.edit_text(
-        "**🔄 Restarting Bot...**\n\n"
-        "The bot will be back online in a few seconds.\n"
-        "Please wait..."
-    )
+    await cb.answer("Restarting...")
+    await cb.message.edit_text("**🔄 Restarting...**")
     
     try:
-        LOGGER.info("RESTART initiated by admin")
         if main_bot and main_bot.is_connected:
             await main_bot.stop()
-        
         await asyncio.sleep(1)
-    except Exception as e:
-        LOGGER.error(f"Error during restart cleanup: {e}")
+    except:
+        pass
     
     os.execl(sys.executable, sys.executable, *sys.argv)
 
@@ -924,13 +1003,14 @@ async def main_menu_callback(client, cb: CallbackQuery):
     await cb.answer()
     await update_user_conversation(cb.message.chat.id, None)
     await cb.message.edit_text(
-        "**👋 Welcome, Admin!**\n\n"
-        "This is your streaming bot's control panel.\n"
+        "**👋 Admin Control Panel**\n\n"
+        "Bot Version: 6.0 (FIXED)\n"
         "What would you like to do?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart")]
+            [InlineKeyboardButton("🗑️ Clear Cache", callback_data="admin_clear_cache")],
+            [InlineKeyboardButton("🔄 Restart", callback_data="admin_restart")]
         ])
     )
 
@@ -946,56 +1026,35 @@ async def text_message_handler(client, message: Message):
     if stage == "awaiting_domain":
         new_domain = message.text.strip()
         
-        # Validation
         if not new_domain or " " in new_domain:
-            return await message.reply_text(
-                "❌ **Invalid Format**\n\n"
-                "Please send a valid domain without spaces.\n"
-                "Example: `keralacaptain.shop`"
-            )
+            return await message.reply_text("❌ Invalid format")
         
-        # Remove protocols if user included them
         new_domain = new_domain.replace("http://", "").replace("https://", "")
         
         if "." not in new_domain:
-            return await message.reply_text(
-                "❌ **Invalid Domain**\n\n"
-                "Domain must contain at least one dot (.).\n"
-                "Example: `keralacaptain.shop`"
-            )
+            return await message.reply_text("❌ Invalid domain")
         
         try:
-            status_msg = await message.reply_text("⏳ Saving new domain...")
-            saved_domain = await set_protected_domain(new_domain)
+            status = await message.reply_text("⏳ Saving...")
+            saved = await set_protected_domain(new_domain)
             
-            await status_msg.edit_text(
-                f"✅ **Domain Updated Successfully!**\n\n"
-                f"New Protected Domain:\n`{saved_domain}`\n\n"
-                f"Streams will now ONLY work when accessed from this domain.",
+            await status.edit_text(
+                f"✅ **Updated**\n\nNew domain:\n`{saved}`",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back to Settings", callback_data="admin_settings")]
+                    [InlineKeyboardButton("⬅️ Back", callback_data="admin_settings")]
                 ])
             )
             await update_user_conversation(chat_id, None)
             
         except Exception as e:
-            LOGGER.error(f"Failed to save domain: {e}", exc_info=True)
-            await status_msg.edit_text(
-                f"❌ **Error Saving Domain**\n\n"
-                f"Could not update domain: `{str(e)}`\n\n"
-                f"Please try again.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Try Again", callback_data="admin_set_domain")],
-                    [InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]
-                ])
-            )
+            await status.edit_text(f"❌ Error: {e}")
 
 # ============================================================================ #
 # APPLICATION LIFECYCLE
 # ============================================================================ #
 
 async def ping_server():
-    """Keeps server alive on platforms like Render/Heroku"""
+    """Keep server alive"""
     while True:
         await asyncio.sleep(Config.PING_INTERVAL)
         try:
@@ -1007,82 +1066,79 @@ async def ping_server():
 
 if __name__ == "__main__":
     async def main_startup_shutdown_logic():
-        """Handles graceful startup and shutdown"""
+        """Startup and shutdown"""
         global CURRENT_PROTECTED_DOMAIN
         
         LOGGER.info("=" * 60)
-        LOGGER.info("KeralaCaptain Streaming Bot v5.0 - Starting Up")
+        LOGGER.info("KeralaCaptain Bot V6.0 - FIXED VERSION")
         LOGGER.info("=" * 60)
         
-        # Fetch protected domain from database
-        LOGGER.info("Loading protected domain from database...")
+        # Load domain
         CURRENT_PROTECTED_DOMAIN = await get_protected_domain()
-        LOGGER.info(f"✅ Protected Domain: {CURRENT_PROTECTED_DOMAIN}")
+        LOGGER.info(f"✅ Domain: {CURRENT_PROTECTED_DOMAIN}")
         
-        # Create database indexes
-        LOGGER.info("Creating database indexes...")
+        # Create indexes
         try:
             await media_collection.create_index("tmdb_id", unique=True)
             await media_collection.create_index("wp_post_id", unique=True)
-            LOGGER.info("✅ Database indexes created")
+            LOGGER.info("✅ DB indexes ready")
         except Exception as e:
-            LOGGER.warning(f"Index creation warning: {e}")
+            LOGGER.warning(f"Index warning: {e}")
         
-        # Start main bot
-        LOGGER.info("Starting main bot...")
+        # Start bot
         try:
             await main_bot.start()
             bot_info = await main_bot.get_me()
-            LOGGER.info(f"✅ Main Bot: @{bot_info.username}")
+            LOGGER.info(f"✅ Bot: @{bot_info.username}")
         except FloodWait as e:
-            LOGGER.error(f"FloodWait on startup: {e.value}s. Waiting...")
+            LOGGER.error(f"FloodWait {e.value}s, waiting...")
             await asyncio.sleep(e.value + 5)
             await main_bot.start()
             bot_info = await main_bot.get_me()
-            LOGGER.info(f"✅ Main Bot: @{bot_info.username} (after wait)")
+            LOGGER.info(f"✅ Bot: @{bot_info.username}")
         except Exception as e:
-            LOGGER.critical(f"❌ Failed to start main bot: {e}", exc_info=True)
+            LOGGER.critical(f"❌ Bot start failed: {e}", exc_info=True)
             raise
             
-        # Initialize additional clients
-        LOGGER.info("Initializing streaming clients...")
+        # Initialize clients
         await initialize_clients()
-        LOGGER.info(f"✅ Total clients active: {len(multi_clients)}")
+        LOGGER.info(f"✅ Clients: {len(multi_clients)}")
         
-        # Start ping task if on Heroku/Render
+        # Start background tasks
         if Config.ON_HEROKU:
-            LOGGER.info("Platform detected: Heroku/Render - Starting ping task")
             asyncio.create_task(ping_server())
         
+        asyncio.create_task(periodic_cache_cleanup())
+        LOGGER.info("✅ Cache cleanup task started")
+        
         # Start web server
-        LOGGER.info(f"Starting web server on port {Config.PORT}...")
         web_app = await web_server()
         runner = web.AppRunner(web_app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
         await site.start()
-        LOGGER.info(f"✅ Web server running: {Config.STREAM_URL}")
+        LOGGER.info(f"✅ Server: {Config.STREAM_URL}")
         
-        # Send startup notification to admin
+        # Notify admin
         try:
-            startup_msg = (
-                f"**✅ Bot Started Successfully!**\n\n"
-                f"**🌐 Stream URL:** `{Config.STREAM_URL}`\n"
-                f"**🔒 Protected Domain:** `{CURRENT_PROTECTED_DOMAIN}`\n"
-                f"**📡 Active Clients:** `{len(multi_clients)}`\n"
-                f"**⏱ Started At:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                f"**Security Status:**\n"
-                f"✅ User-Agent blocking enabled\n"
-                f"✅ Download prevention active\n"
-                f"✅ Referer validation enabled\n"
-                f"✅ Adaptive bandwidth optimization active"
+            await main_bot.send_message(
+                Config.ADMIN_IDS[0],
+                f"**✅ Bot Started (V6.0 FIXED)**\n\n"
+                f"**URL:** `{Config.STREAM_URL}`\n"
+                f"**Domain:** `{CURRENT_PROTECTED_DOMAIN}`\n"
+                f"**Clients:** `{len(multi_clients)}`\n"
+                f"**Cache:** `{humanbytes(get_cache_size())}`\n\n"
+                f"**Fixes Applied:**\n"
+                f"✅ Fixed chunk size (1MB)\n"
+                f"✅ Fixed cache headers\n"
+                f"✅ Disk caching enabled\n"
+                f"✅ Mobile compatibility improved"
             )
-            await main_bot.send_message(Config.ADMIN_IDS[0], startup_msg)
-        except Exception as e:
-            LOGGER.warning(f"Could not send startup notification: {e}")
+        except:
+            pass
         
         LOGGER.info("=" * 60)
-        LOGGER.info("🚀 All systems operational - Bot is ready!")
+        LOGGER.info("🚀 ALL SYSTEMS READY")
         LOGGER.info("=" * 60)
                 
         await asyncio.Event().wait()
@@ -1090,35 +1146,30 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
 
     async def shutdown_handler(sig):
-        LOGGER.info(f"⚠️ Received signal {sig.name} - Shutting down gracefully...")
+        LOGGER.info(f"⚠️ Shutdown signal: {sig.name}")
         
         if main_bot and main_bot.is_connected:
-            LOGGER.info("Stopping main bot...")
             try:
                 await main_bot.stop()
-                LOGGER.info("✅ Main bot stopped")
-            except Exception as e:
-                LOGGER.error(f"Error stopping main bot: {e}")
+                LOGGER.info("✅ Bot stopped")
+            except:
+                pass
         
-        # Stop all multi clients
         for client_id, client in list(multi_clients.items()):
             if client_id == 0:
-                continue  # Already stopped main bot
+                continue
             try:
                 if client.is_connected:
                     await client.stop()
-                    LOGGER.info(f"✅ Client {client_id} stopped")
-            except Exception as e:
-                LOGGER.error(f"Error stopping client {client_id}: {e}")
+            except:
+                pass
         
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
         if tasks:
-            LOGGER.info(f"Cancelling {len(tasks)} pending tasks...")
             [task.cancel() for task in tasks]
             await asyncio.gather(*tasks, return_exceptions=True)
         
         loop.stop()
-        LOGGER.info("✅ Shutdown complete")
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(
@@ -1130,13 +1181,12 @@ if __name__ == "__main__":
         loop.run_until_complete(main_startup_shutdown_logic())
         loop.run_forever()
     except KeyboardInterrupt:
-        LOGGER.info("Keyboard interrupt received")
+        LOGGER.info("Keyboard interrupt")
     except Exception as e:
-        LOGGER.critical(f"💥 Critical error: {e}", exc_info=True)
+        LOGGER.critical(f"💥 Fatal: {e}", exc_info=True)
     finally:
-        LOGGER.info("Cleaning up...")
         if loop.is_running():
             loop.stop()
         if not loop.is_closed():
             loop.close()
-        LOGGER.info("👋 Goodbye!")
+        LOGGER.info("👋 Shutdown complete")
