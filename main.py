@@ -1114,18 +1114,7 @@ async def cache_cleaner_loop():
 
 # -------------------------------------------------------------------------------- #
 # APPLICATION LIFECYCLE (CLEANED)
-# -------------------------------------------------------------------------------- #
-
-async def ping_server():
-    """Pings the server to keep it alive on platforms like Heroku."""
-    while True:
-        await asyncio.sleep(Config.PING_INTERVAL)
-        try:
-            async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as session:
-                async with session.get(Config.STREAM_URL) as resp:
-                    LOGGER.info(f"Pinged server with status: {resp.status}")
-        except Exception as e:
-            LOGGER.warning(f"Failed to ping server: {e}")
+# -------------------------------------------------------------------------------- #)
 
 if __name__ == "__main__":
     # Globals to be set by startup logic so shutdown can cleanup them
