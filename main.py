@@ -10,9 +10,7 @@ import logging
 import aiohttp
 import urllib.parse
 import sys
-import psutil
-import hashlib
-from pathlib import Path
+import psutil # For stats
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web, ClientConnectionError, ClientTimeout
@@ -26,29 +24,28 @@ from pyrogram import raw
 from pyrogram.raw.types import InputPhotoFileLocation, InputDocumentFileLocation
 
 # -------------------------------------------------------------------------------- #
-# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Optimized with Caching)         #
+# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Cleaned)                         #
 # -------------------------------------------------------------------------------- #
 
+# Load configurations from .env file
 load_dotenv()
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s] - %(message)s')
 LOGGER = logging.getLogger(__name__)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
 
+# --- NEW: Record bot start time ---
 start_time = time.time()
-
-# --- NEW: Cache Configuration ---
-CACHE_DIR = Path("./cache")
-CACHE_DIR.mkdir(exist_ok=True)
-CACHE_MAX_AGE = 1800  # 30 minutes in seconds
-CACHE_CLEANUP_INTERVAL = 600  # 10 minutes in seconds
 
 class Config:
     API_ID = int(os.environ.get("API_ID", 0))
     API_HASH = os.environ.get("API_HASH", "")
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    # REMOVED: BACKUP_BOT_TOKEN (no longer needed)
     
+    # --- NEW: Admin and Domain Config ---
     ADMIN_IDS = list(int(admin_id) for admin_id in os.environ.get("ADMIN_IDS", "6644681404").split())
     PROTECTED_DOMAIN = os.environ.get("PROTECTED_DOMAIN", "https://www.keralacaptain.shop/").rstrip('/') + '/'
     
@@ -60,30 +57,24 @@ class Config:
     PING_INTERVAL = int(os.environ.get("PING_INTERVAL", 1200))
     ON_HEROKU = 'DYNO' in os.environ
 
+# --- VALIDATE ESSENTIAL CONFIGURATIONS ---
 required_vars = [
     Config.API_ID, Config.API_HASH, Config.BOT_TOKEN,
     Config.MONGO_URI, Config.LOG_CHANNEL_ID, Config.STREAM_URL,
     Config.ADMIN_IDS
 ]
 if not all(required_vars) or Config.ADMIN_IDS == [0]:
-    LOGGER.critical("FATAL: One or more required variables are missing. Cannot start.")
+    LOGGER.critical("FATAL: One or more required variables (API_ID, API_HASH, BOT_TOKEN, MONGO_URI, LOG_CHANNEL_ID, STREAM_URL, ADMIN_IDS) are missing. Cannot start.")
     exit(1)
 
+# --- NEW: Global variable for the protected domain ---
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
-# --- NEW: Blocked User Agents (Download Managers) ---
-BLOCKED_USER_AGENTS = [
-    'IDM', 'Internet Download Manager', 'DownloadManager', 
-    'ADM', 'Advanced Download Manager', '1DM', 'FDM', 
-    'Free Download Manager', 'JDownloader', 'FlashGet',
-    'Solo Browser', 'UC Browser', 'GetRight', 'Download Accelerator',
-    'Ninja Download Manager', 'uTorrent', 'BitTorrent'
-]
-
 # -------------------------------------------------------------------------------- #
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS & CLASSES
 # -------------------------------------------------------------------------------- #
 
+# --- Base64 Encoding/Decoding for Stream URLs (Kept for compatibility) ---
 async def encode(string: str) -> str:
     string_bytes = string.encode("ascii")
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
@@ -95,6 +86,7 @@ async def decode(base64_string: str) -> str:
     string_bytes = base64.urlsafe_b64decode(base64_bytes)
     return string_bytes.decode("ascii")
 
+# --- Human-readable formatters (Kept for new stats panel) ---
 def humanbytes(size):
     if not size: return "0 B"
     power = 1024
@@ -106,6 +98,7 @@ def humanbytes(size):
     return f"{round(size, 2)} {power_labels[n]}B"
 
 def get_readable_time(seconds: int) -> str:
+    """Return a human-readable time format"""
     result = ""
     (days, remainder) = divmod(seconds, 86400)
     days = int(days)
@@ -123,101 +116,87 @@ def get_readable_time(seconds: int) -> str:
     result += f"{seconds}s"
     return result
 
-# --- NEW: Cache helper functions ---
-def get_cache_path(message_id: int) -> Path:
-    """Generate cache file path for a message ID"""
-    return CACHE_DIR / f"{message_id}.cache"
-
-def is_cache_valid(cache_path: Path) -> bool:
-    """Check if cached file exists and is not too old"""
-    if not cache_path.exists():
-        return False
-    
-    file_age = time.time() - cache_path.stat().st_mtime
-    return file_age < CACHE_MAX_AGE
-
-async def cleanup_old_cache():
-    """Background task to clean up old cache files"""
-    while True:
-        try:
-            await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
-            now = time.time()
-            deleted_count = 0
-            total_freed = 0
-            
-            for cache_file in CACHE_DIR.glob("*.cache"):
-                try:
-                    file_age = now - cache_file.stat().st_mtime
-                    if file_age > CACHE_MAX_AGE:
-                        file_size = cache_file.stat().st_size
-                        cache_file.unlink()
-                        deleted_count += 1
-                        total_freed += file_size
-                except Exception as e:
-                    LOGGER.warning(f"Failed to delete cache file {cache_file}: {e}")
-            
-            if deleted_count > 0:
-                LOGGER.info(f"Cache cleanup: Deleted {deleted_count} files, freed {humanbytes(total_freed)}")
-        except Exception as e:
-            LOGGER.error(f"Error in cache cleanup task: {e}")
-
 # -------------------------------------------------------------------------------- #
 # DATABASE OPERATIONS
 # -------------------------------------------------------------------------------- #
 
+# ================================================================================ #
+# DATABASE OPERATIONS (Kept original + New Settings)
+# ================================================================================ #
+
 db_client = AsyncIOMotorClient(Config.MONGO_URI)
 db = db_client['KeralaCaptainBotDB']
 
+# Primary collection for all normal operations (Kept as is)
 media_collection = db['media']
+# Backup collection (Kept as is)
 media_backup_collection = db['media_backup']
+# User conversations (Kept for new settings panel)
 user_conversations_col = db['conversations']
+# --- NEW: Collection for bot settings ---
 settings_collection = db['settings']
 
+
+# --- Database Functions (Kept original read/write functions for streaming logic) ---
+
 async def check_duplicate(tmdb_id):
+    """Checks for duplicates only in the main collection."""
     return await media_collection.find_one({"tmdb_id": tmdb_id})
 
 async def add_media_to_db(data):
+    """Inserts new media data into both the main and backup collections."""
     await media_collection.insert_one(data)
-    await media_backup_collection.insert_one(data)
+    await media_backup_collection.insert_one(data) # Also write to the backup
 
 async def get_media_by_post_id(post_id: int):
+    """Reads media data only from the main collection for regular use."""
     return await media_collection.find_one({"wp_post_id": post_id})
 
 async def update_media_links_in_db(post_id: int, new_message_ids: dict, new_stream_link: str):
+    """Updates links in both the main and backup collections."""
     update_query = {
         "$set": {"message_ids": new_message_ids, "stream_link": new_stream_link}
     }
     await media_collection.update_one({"wp_post_id": post_id}, update_query)
-    await media_backup_collection.update_one({"wp_post_id": post_id}, update_query)
+    await media_backup_collection.update_one({"wp_post_id": post_id}, update_query) # Also update the backup
 
 async def delete_media_from_db(post_id: int):
+    """Deletes media data from both the main and backup collections."""
     result_main = await media_collection.delete_one({"wp_post_id": post_id})
-    await media_backup_collection.delete_one({"wp_post_id": post_id})
+    await media_backup_collection.delete_one({"wp_post_id": post_id}) # Also delete from the backup
     return result_main
 
 async def get_stats():
+    """Calculates stats based only on the main collection."""
     movies_count = await media_collection.count_documents({"type": "movie"})
     series_count = await media_collection.count_documents({"type": "series"})
     return movies_count, series_count
 
 async def get_all_media_for_library(page: int = 0, limit: int = 10):
+    """Fetches the library list only from the main collection."""
     cursor = media_collection.find().sort("added_at", -1).skip(page * limit).limit(limit)
     return await cursor.to_list(length=limit)
 
 async def get_user_conversation(chat_id):
+    """Manages user conversation state."""
     return await user_conversations_col.find_one({"_id": chat_id})
 
 async def update_user_conversation(chat_id, data):
+    """Manages user conversation state."""
     if data:
         await user_conversations_col.update_one({"_id": chat_id}, {"$set": data}, upsert=True)
     else:
         await user_conversations_col.delete_one({"_id": chat_id})
 
 async def get_post_id_from_msg_id(msg_id: int):
+    """Helper for stream refreshing. Reads only from the main collection."""
     doc = await media_collection.find_one({"message_ids": {"$in": [msg_id]}})
     return doc['wp_post_id'] if doc else None
 
+# --- NEW: Database functions for Domain Settings ---
+
 async def get_protected_domain() -> str:
+    """Fetches the protected domain from settings, returns default if not found."""
     try:
         doc = await settings_collection.find_one({"_id": "bot_settings"})
         if doc and "protected_domain" in doc:
@@ -225,9 +204,11 @@ async def get_protected_domain() -> str:
     except Exception as e:
         LOGGER.error(f"Could not fetch domain from DB: {e}. Using default.")
     
+    # Fallback to default from Config
     return Config.PROTECTED_DOMAIN
 
 async def set_protected_domain(new_domain: str):
+    """Saves the new protected domain to the database."""
     global CURRENT_PROTECTED_DOMAIN
     if not (new_domain.startswith("https://") or new_domain.startswith("http://")):
         new_domain = "https://" + new_domain
@@ -239,32 +220,38 @@ async def set_protected_domain(new_domain: str):
         {"$set": {"protected_domain": new_domain}},
         upsert=True
     )
-    CURRENT_PROTECTED_DOMAIN = new_domain
+    CURRENT_PROTECTED_DOMAIN = new_domain # Update global variable
     LOGGER.info(f"Protected domain updated in DB: {new_domain}")
     return new_domain
 
+# ================================================================================ #
+# END OF DATABASE OPERATIONS SECTION
+# ================================================================================ #
+
+
 # -------------------------------------------------------------------------------- #
-# STREAMING ENGINE & WEB SERVER
+# STREAMING ENGINE & WEB SERVER (UNCHANGED CORE LOGIC)
 # -------------------------------------------------------------------------------- #
 
 multi_clients = {}
 work_loads = {}
 class_cache = {}
-processed_media_groups = {}
+processed_media_groups = {} # Kept for FileReference logic
 next_client_idx = 0 
 stream_errors = 0 
 last_error_reset = time.time()
 
+# Upgraded ByteStreamer (Kept As Is)
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client: Client = client
-        self.cached_file_ids = {}
-        self.session_cache = {}
+        self.cached_file_ids = {} # Cache for file properties
+        self.session_cache = {} # {dc_id: (session, timestamp)} for TTL
         asyncio.create_task(self.clean_cache_regularly())
 
     async def clean_cache_regularly(self):
         while True:
-            await asyncio.sleep(1200)
+            await asyncio.sleep(1200) # 20 min
             self.cached_file_ids.clear()
             self.session_cache.clear() 
             LOGGER.info("Cleared ByteStreamer's cached file properties and sessions.")
@@ -292,14 +279,14 @@ class ByteStreamer:
 
         if dc_id in self.session_cache:
             session, ts = self.session_cache[dc_id]
-            if time.time() - ts < 300:
+            if time.time() - ts < 300: # 5min TTL
                 LOGGER.debug(f"Reusing TTL-cached media session for DC {dc_id}")
                 return session
 
         if media_session:
             try:
                 await media_session.send(raw.functions.help.GetConfig(), timeout=10)
-                self.session_cache[dc_id] = (media_session, time.time())
+                self.session_cache[dc_id] = (media_session, time.time()) # Cache on success
                 LOGGER.debug(f"Reusing pinged media session for DC {dc_id}")
                 return media_session
             except Exception as e:
@@ -329,7 +316,7 @@ class ByteStreamer:
             await media_session.start()
 
         self.client.media_sessions[dc_id] = media_session
-        self.session_cache[dc_id] = (media_session, time.time())
+        self.session_cache[dc_id] = (media_session, time.time()) # Cache new
         return media_session
 
     @staticmethod
@@ -363,6 +350,7 @@ class ByteStreamer:
                     break
 
             except FileReferenceExpired:
+                # This logic is CRUCIAL and why we kept the DB functions
                 retry_count += 1
                 if retry_count > max_retries:
                     raise 
@@ -370,30 +358,34 @@ class ByteStreamer:
                 
                 original_msg = await self.client.get_messages(Config.LOG_CHANNEL_ID, message_id)
                 if original_msg:
-                    refreshed_msg = await forward_file_safely(original_msg)
+                    refreshed_msg = await forward_file_safely(original_msg) # Uses forward_file_safely
                     if refreshed_msg:
                         new_file_id = await self.get_file_properties(refreshed_msg.id)
                         self.cached_file_ids[message_id] = new_file_id 
                         
-                        post_id = await get_post_id_from_msg_id(message_id)
+                        # Update DB
+                        post_id = await get_post_id_from_msg_id(message_id) # Uses get_post_id_from_msg_id
                         if post_id:
-                            media_doc = await get_media_by_post_id(post_id)
+                            media_doc = await get_media_by_post_id(post_id) # Uses get_media_by_post_id
                             if media_doc:
                                 old_qualities = media_doc['message_ids']
+                                # Find the key (quality) for the old message_id
                                 quality_key = next((k for k, v in old_qualities.items() if v == message_id), None)
                                 
                                 new_qualities = old_qualities
                                 if quality_key:
                                     new_qualities[quality_key] = refreshed_msg.id
                                 else:
+                                    # Fallback if key not found (shouldn't happen)
                                     new_qualities = {k: refreshed_msg.id if v == message_id else v for k, v in old_qualities.items()}
 
+                                # Uses update_media_links_in_db
                                 await update_media_links_in_db(post_id, new_qualities, media_doc['stream_link'])
                                 
-                        location = self.get_location(new_file_id)
+                        location = self.get_location(new_file_id) # Recreate location
                         await asyncio.sleep(2) 
-                        continue
-                raise
+                        continue # Retry fetch
+                raise # Failed refresh
 
             except FloodWait as e:
                 LOGGER.warning(f"FloodWait of {e.value} seconds on get_file. Waiting...")
@@ -418,20 +410,12 @@ async def health_handler(request):
         sample_client = list(multi_clients.values())[0]
         if sample_client in class_cache:
             cache_size = len(class_cache[sample_client].cached_file_ids)
-    
-    # --- NEW: Cache stats ---
-    cache_files = list(CACHE_DIR.glob("*.cache"))
-    cache_count = len(cache_files)
-    cache_total_size = sum(f.stat().st_size for f in cache_files)
-    
     return web.json_response({
         "status": "ok",
         "active_clients": active_sessions,
         "cache_size": cache_size,
         "stream_errors_last_min": stream_errors,
         "workloads": work_loads,
-        "disk_cache_files": cache_count,
-        "disk_cache_size": humanbytes(cache_total_size)
     })
 
 @routes.get("/favicon.ico")
@@ -441,77 +425,21 @@ async def favicon_handler(request):
 @routes.get(r"/stream/{message_id:\d+}")
 async def stream_handler(request: web.Request):
     client_index = None 
-    cache_file = None
-    cache_write_task = None
-    
     try:
-        # --- NEW: Block Download Managers ---
-        user_agent = request.headers.get('User-Agent', '')
-        if any(blocked.lower() in user_agent.lower() for blocked in BLOCKED_USER_AGENTS):
-            LOGGER.warning(f"Blocked download manager: {user_agent}")
-            return web.Response(status=403, text="403 Forbidden: Download managers are not allowed.")
-        
-        # --- Referer Check ---
+        # --- MODIFIED: Referer Check ---
         referer = request.headers.get('Referer')
+        
+        # Use the dynamic domain from the global variable
         allowed_referer = CURRENT_PROTECTED_DOMAIN 
 
         if not referer or not referer.startswith(allowed_referer):
             LOGGER.warning(f"Blocked hotlink attempt. Referer: {referer}. Allowed: {allowed_referer}")
             return web.Response(status=403, text="403 Forbidden: Direct access is not allowed.")
+            
+        # --- END OF MODIFICATION ---
 
         message_id = int(request.match_info['message_id'])
         range_header = request.headers.get("Range", 0)
-        
-        # --- NEW: Check disk cache first ---
-        cache_path = get_cache_path(message_id)
-        if is_cache_valid(cache_path):
-            LOGGER.info(f"✅ CACHE HIT for message {message_id}. Serving from disk.")
-            
-            # Serve from cache
-            file_size = cache_path.stat().st_size
-            
-            from_bytes = 0
-            if range_header:
-                from_bytes_str, _ = range_header.replace("bytes=", "").split("-")
-                from_bytes = int(from_bytes_str)
-
-            if from_bytes >= file_size:
-                return web.Response(status=416, reason="Range Not Satisfiable")
-
-            cors_headers = { 'Access-Control-Allow-Origin': allowed_referer }
-            
-            resp = web.StreamResponse(
-                status=206 if range_header else 200,
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
-                    "Content-Length": str(file_size - from_bytes),
-                    "Accept-Ranges": "bytes",
-                    "Content-Disposition": "inline",  # Force inline playback
-                    "Cache-Control": "private, max-age=3600",
-                    **cors_headers
-                }
-            )
-            await resp.prepare(request)
-            
-            # Stream from disk
-            with open(cache_path, 'rb') as f:
-                f.seek(from_bytes)
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    try:
-                        await resp.write(chunk)
-                        await resp.drain()  # Detect disconnects
-                    except (ConnectionError, asyncio.CancelledError, ConnectionResetError):
-                        LOGGER.warning(f"Client disconnected while reading from cache for {message_id}.")
-                        return resp
-            
-            return resp
-
-        # --- CACHE MISS: Download from Telegram ---
-        LOGGER.info(f"❌ CACHE MISS for message {message_id}. Downloading from Telegram...")
 
         min_load = min(work_loads.values())
         candidates = [cid for cid, load in work_loads.items() if load == min_load]
@@ -541,7 +469,7 @@ async def stream_handler(request: web.Request):
         if from_bytes >= file_size:
             return web.Response(status=416, reason="Range Not Satisfiable")
 
-        chunk_size = 1024 * 1024  # CONSTANT - DO NOT CHANGE
+        chunk_size = 1024 * 1024
         offset = from_bytes - (from_bytes % chunk_size)
         first_part_cut = from_bytes - offset
         
@@ -554,77 +482,37 @@ async def stream_handler(request: web.Request):
                 "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
                 "Content-Length": str(file_size - from_bytes),
                 "Accept-Ranges": "bytes",
-                "Content-Disposition": "inline",  # Force inline playback
-                "Cache-Control": "private, max-age=3600",  # Allow browser caching
                 **cors_headers
             }
         )
         await resp.prepare(request)
 
-        # --- NEW: Open cache file for writing ---
-        cache_file = open(cache_path, 'wb')
-        LOGGER.info(f"Caching file to {cache_path}")
-
+        # Auto-refresh logic is inside yield_file
         body_generator = tg_connect.yield_file(file_id, offset, chunk_size, message_id)
 
         is_first_chunk = True
         async for chunk in body_generator:
             try:
-                # Write to user
                 if is_first_chunk and first_part_cut > 0:
                     await resp.write(chunk[first_part_cut:])
                     is_first_chunk = False
                 else:
                     await resp.write(chunk)
-                
-                # --- CRITICAL: Detect disconnect immediately ---
-                await resp.drain()
-                
-                # --- NEW: Write to cache ---
-                if cache_file:
-                    cache_file.write(chunk)
-                    
-            except (ConnectionError, asyncio.CancelledError, ConnectionResetError) as e:
-                LOGGER.warning(f"⚠️ Client disconnected for {message_id}. Stopping Telegram download immediately.")
-                # Close cache file properly
-                if cache_file:
-                    cache_file.close()
-                    cache_file = None
+            except (ConnectionError, asyncio.CancelledError):
+                LOGGER.warning(f"Client disconnected while writing chunk for message {message_id}.")
                 return resp
-
-        # Close cache file on successful completion
-        if cache_file:
-            cache_file.close()
-            cache_file = None
-            LOGGER.info(f"✅ Successfully cached file for message {message_id}")
 
         return resp
 
     except (FileReferenceExpired, AuthBytesInvalid) as e:
         LOGGER.error(f"FATAL STREAM ERROR for {message_id}: {type(e).__name__}. Client needs to refresh.")
-        # Clean up partial cache
-        if cache_file:
-            cache_file.close()
-            try:
-                cache_path.unlink()
-            except: pass
         return web.Response(status=410, text="Stream link expired, please refresh the page.")
 
     except Exception as e:
         LOGGER.critical(f"Unhandled stream error for {message_id}: {e}", exc_info=True)
-        # Clean up partial cache
-        if cache_file:
-            cache_file.close()
-            try:
-                get_cache_path(message_id).unlink()
-            except: pass
         return web.Response(status=500)
 
     finally:
-        # Ensure cache file is closed
-        if cache_file:
-            cache_file.close()
-            
         if client_index is not None:
             work_loads[client_index] -= 1
             LOGGER.debug(f"Decremented workload for client {client_index}. Current workloads: {work_loads}")
@@ -633,12 +521,13 @@ async def web_server():
     web_app = web.Application(client_max_size=30_000_000)
     web_app.add_routes(routes)
     return web_app
-
+            
 # -------------------------------------------------------------------------------- #
-# BOT & CLIENT INITIALIZATION
+# BOT & CLIENT INITIALIZATION (CLEANED)
 # -------------------------------------------------------------------------------- #
 
 main_bot = Client("KeralaCaptainBot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=Config.BOT_TOKEN)
+# REMOVED: backup_bot (no longer needed)
 
 class TokenParser:
     def parse_from_env(self):
@@ -647,6 +536,7 @@ class TokenParser:
 async def initialize_clients():
     multi_clients[0] = main_bot
     work_loads[0] = 0
+    # REMOVED: backup_bot logic (no longer needed)
     
     all_tokens = TokenParser().parse_from_env()
     if not all_tokens:
@@ -669,6 +559,11 @@ async def initialize_clients():
         LOGGER.info(f"Successfully initialized {len(multi_clients)} clients. Multi-Client mode is ON.")
 
 async def forward_file_safely(message_to_forward: Message):
+    """
+    Sends a file to the log channel using send_cached_media.
+    (Kept for FileReferenceExpired logic)
+    (REMOVED: Backup bot logic)
+    """
     try:
         media = message_to_forward.document or message_to_forward.video
         if not media:
@@ -689,9 +584,10 @@ async def forward_file_safely(message_to_forward: Message):
         return None
 
 # -------------------------------------------------------------------------------- #
-# BOT HANDLERS
+# NEW BOT HANDLERS (ADMIN ONLY)
 # -------------------------------------------------------------------------------- #
 
+# --- NEW: Admin filter ---
 admin_only = filters.user(Config.ADMIN_IDS)
 
 @main_bot.on_message(filters.command("start") & filters.private & admin_only)
@@ -701,18 +597,20 @@ async def start_command(client, message):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("🗑️ Clear Cache", callback_data="admin_clear_cache")],
             [InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart")]
         ])
     )
+    # Clear any old conversation state
     await update_user_conversation(message.chat.id, None)
 
 @main_bot.on_callback_query(filters.regex("^admin_stats$") & admin_only)
 async def stats_callback(client, cb: CallbackQuery):
     await cb.answer("Fetching stats...")
     
+    # Uptime
     uptime = get_readable_time(time.time() - start_time)
     
+    # System Stats
     try:
         cpu_usage = psutil.cpu_percent()
         ram_usage = psutil.virtual_memory().percent
@@ -723,13 +621,9 @@ async def stats_callback(client, cb: CallbackQuery):
         cpu_usage = ram_usage = disk_usage = "N/A"
         ram_total = "N/A"
 
+    # Bot Stats
     active_clients = len(multi_clients)
     workload_str = "\n".join([f"  - Client {cid}: {load} streams" for cid, load in work_loads.items()])
-    
-    # Cache stats
-    cache_files = list(CACHE_DIR.glob("*.cache"))
-    cache_count = len(cache_files)
-    cache_total_size = sum(f.stat().st_size for f in cache_files)
 
     text = f"**📊 Bot Statistics**\n\n" \
            f"**Uptime:** `{uptime}`\n\n" \
@@ -740,11 +634,7 @@ async def stats_callback(client, cb: CallbackQuery):
            f"**Streaming:**\n" \
            f"  - Active Clients: `{active_clients}`\n" \
            f"  - Stream Errors (last min): `{stream_errors}`\n" \
-           f"  - Current Workloads:\n{workload_str}\n\n" \
-           f"**Disk Cache:**\n" \
-           f"  - Files: `{cache_count}`\n" \
-           f"  - Size: `{humanbytes(cache_total_size)}`\n" \
-           f"  - Max Age: `{CACHE_MAX_AGE // 60} minutes`"
+           f"  - Current Workloads:\n{workload_str}"
            
     await cb.message.edit_text(
         text,
@@ -754,7 +644,7 @@ async def stats_callback(client, cb: CallbackQuery):
 @main_bot.on_callback_query(filters.regex("^admin_settings$") & admin_only)
 async def settings_callback(client, cb: CallbackQuery):
     await cb.answer()
-    current_domain = await get_protected_domain()
+    current_domain = await get_protected_domain() # Fetch fresh from DB
     
     text = f"**⚙️ Settings**\n\n" \
            f"**Protected Domain:**\n" \
@@ -780,36 +670,6 @@ async def set_domain_callback(client, cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_cancel_conv")]])
     )
 
-@main_bot.on_callback_query(filters.regex("^admin_clear_cache$") & admin_only)
-async def clear_cache_callback(client, cb: CallbackQuery):
-    await cb.answer("Clearing cache...")
-    
-    try:
-        cache_files = list(CACHE_DIR.glob("*.cache"))
-        deleted_count = 0
-        total_freed = 0
-        
-        for cache_file in cache_files:
-            try:
-                file_size = cache_file.stat().st_size
-                cache_file.unlink()
-                deleted_count += 1
-                total_freed += file_size
-            except Exception as e:
-                LOGGER.warning(f"Failed to delete {cache_file}: {e}")
-        
-        await cb.message.edit_text(
-            f"**✅ Cache Cleared!**\n\n"
-            f"Deleted: `{deleted_count}` files\n"
-            f"Freed: `{humanbytes(total_freed)}`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]])
-        )
-    except Exception as e:
-        await cb.message.edit_text(
-            f"**❌ Error!**\n\n{e}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="admin_main_menu")]])
-        )
-
 @main_bot.on_callback_query(filters.regex("^admin_restart$") & admin_only)
 async def restart_callback(client, cb: CallbackQuery):
     await cb.answer()
@@ -828,13 +688,18 @@ async def restart_confirm_callback(client, cb: CallbackQuery):
     await cb.answer("Restarting...")
     await cb.message.edit_text("✅ **Restarting...**\n\nBot will be back online shortly.")
     
+    # --- Real Restart Logic ---
+    # This replaces the current process with a new one
     try:
         LOGGER.info("RESTART triggered by admin.")
+        # Clean up clients before exit
         if main_bot and main_bot.is_connected:
             await main_bot.stop()
+        # REMOVED: backup_bot
     except Exception as e:
         LOGGER.error(f"Error during pre-restart cleanup: {e}")
     
+    # Execute a new instance of the bot
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 @main_bot.on_callback_query(filters.regex("^(admin_main_menu|admin_cancel_conv)$") & admin_only)
@@ -846,7 +711,6 @@ async def main_menu_callback(client, cb: CallbackQuery):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
             [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
-            [InlineKeyboardButton("🗑️ Clear Cache", callback_data="admin_clear_cache")],
             [InlineKeyboardButton("🔄 Restart Bot", callback_data="admin_restart")]
         ])
     )
@@ -862,27 +726,30 @@ async def text_message_handler(client, message: Message):
     if stage == "awaiting_domain":
         new_domain = message.text.strip()
         
+        # Validate domain (simple check)
         if "." not in new_domain or " " in new_domain:
             return await message.reply_text("Invalid format. Please send a valid domain like `keralacaptain.in`.")
         
         try:
             status_msg = await message.reply_text("Saving...")
-            saved_domain = await set_protected_domain(new_domain)
+            saved_domain = await set_protected_domain(new_domain) # This also updates the global var
             
             await status_msg.edit_text(
                 f"✅ **Success!**\n\nProtected domain has been updated to:\n`{saved_domain}`",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Settings", callback_data="admin_settings")]])
             )
-            await update_user_conversation(chat_id, None)
+            await update_user_conversation(chat_id, None) # Clear state
             
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error!**\nCould not save domain: `{e}`")
 
+
 # -------------------------------------------------------------------------------- #
-# APPLICATION LIFECYCLE
+# APPLICATION LIFECYCLE (CLEANED)
 # -------------------------------------------------------------------------------- #
 
 async def ping_server():
+    """Pings the server to keep it alive on platforms like Heroku."""
     while True:
         await asyncio.sleep(Config.PING_INTERVAL)
         try:
@@ -894,21 +761,20 @@ async def ping_server():
 
 if __name__ == "__main__":
     async def main_startup_shutdown_logic():
+        """Handles the graceful startup and shutdown of all services."""
         global CURRENT_PROTECTED_DOMAIN
         
         LOGGER.info(f"Application starting up...")
         
+        # --- NEW: Fetch protected domain on startup ---
         LOGGER.info("Fetching protected domain from database...")
         CURRENT_PROTECTED_DOMAIN = await get_protected_domain()
         LOGGER.info(f"Domain loaded: {CURRENT_PROTECTED_DOMAIN}")
         
+        # DB Indexing (Kept)
         await media_collection.create_index("tmdb_id", unique=True)
         await media_collection.create_index("wp_post_id", unique=True)
         LOGGER.info("DB indexes ensured.")
-        
-        # --- NEW: Start cache cleanup task ---
-        asyncio.create_task(cleanup_old_cache())
-        LOGGER.info("Cache cleanup task started.")
         
         try:
             await main_bot.start()
@@ -923,6 +789,8 @@ if __name__ == "__main__":
         except Exception as e:
             LOGGER.critical(f"Failed to start main bot: {e}", exc_info=True)
             raise
+
+        # REMOVED: Backup bot startup logic
             
         await initialize_clients()
         
@@ -952,6 +820,7 @@ if __name__ == "__main__":
         if main_bot and main_bot.is_connected:
             LOGGER.info("Stopping main bot...")
             await main_bot.stop()
+        # REMOVED: backup_bot shutdown
         
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
         if tasks:
