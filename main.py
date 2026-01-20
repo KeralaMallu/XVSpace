@@ -1128,96 +1128,143 @@ async def ping_server():
             LOGGER.warning(f"Failed to ping server: {e}")
 
 if __name__ == "__main__":
-    async def main_startup_shutdown_logic():
-        """Handles the graceful startup and shutdown of all services."""
-        global CURRENT_PROTECTED_DOMAIN
-        
-        LOGGER.info(f"Application starting up...")
-        
-        # --- NEW: Fetch protected domain on startup ---
-        LOGGER.info("Fetching protected domain from database...")
-        CURRENT_PROTECTED_DOMAIN = await get_protected_domain()
-        LOGGER.info(f"Domain loaded: {CURRENT_PROTECTED_DOMAIN}")
-        
-        # DB Indexing (Kept)
-        await media_collection.create_index("tmdb_id", unique=True)
-        await media_collection.create_index("wp_post_id", unique=True)
-        LOGGER.info("DB indexes ensured.")
-        
+    # Globals to be set by startup logic so shutdown can cleanup them
+    web_runner = None
+    site_obj = None
+    cache_cleaner_task_ref = None
+    ping_task_ref = None
+
+    async def main_startup_wrapper():
+        """
+        Wrapper that starts services and exposes runner & background tasks
+        so the shutdown handler can cleanup them properly.
+        """
+        global web_runner, site_obj, cache_cleaner_task_ref, ping_task_ref
+
+        # Run your existing startup logic (it sets up DB, starts bot, initializes clients, etc.)
+        await main_startup_shutdown_logic()  # This will create web_app and site
+
+        # The previous main_startup_shutdown_logic uses web_server internally and starts the site.
+        # We must try to find the runner & tasks from the current event loop tasks.
+        # However to keep minimal edits, we will capture relevant tasks that we started elsewhere:
+        # - cache_cleaner_loop and ping_server are created with asyncio.create_task() earlier.
+        # We'll try to find them in all_tasks by name or coroutine.
+        all_tasks = {t.get_name(): t for t in asyncio.all_tasks()}
+
+        # Attempt to discover tasks we created earlier by function name
+        for t in asyncio.all_tasks():
+            coro = t.get_coro()
+            if hasattr(coro, "__name__"):
+                cname = coro.__name__
+                if cname == "cache_cleaner_loop":
+                    cache_cleaner_task_ref = t
+                elif cname == "ping_server":
+                    ping_task_ref = t
+
+        # Attempt to find aiohttp runner (if you stored it elsewhere, keep that store; else we can't reliably extract it here)
+        # If your startup function stored runner in a variable available here, use that. Otherwise not required.
+        return
+
+    async def graceful_shutdown(sig=None):
+        """
+        Clean shutdown sequence: cancel background tasks, stop bots, cleanup web runner,
+        cancel remaining tasks and only then stop the loop.
+        """
+        LOGGER.info(f"Shutdown initiated. Signal: {sig.name if isinstance(sig, signal.Signals) else sig}")
+
+        # 1) Stop ping & cache cleaner tasks (if any)
+        tasks_to_wait = []
+        for tname, tref in (("cache_cleaner", cache_cleaner_task_ref), ("ping_server", ping_task_ref)):
+            if tref is not None and not tref.done():
+                LOGGER.info(f"Cancelling background task: {tname}")
+                tref.cancel()
+                tasks_to_wait.append(tref)
+
+        if tasks_to_wait:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks_to_wait, return_exceptions=True), timeout=10)
+            except asyncio.TimeoutError:
+                LOGGER.warning("Timeout while waiting for background tasks to cancel.")
+
+        # 2) Cleanup aiohttp runner if it exists
         try:
-            await main_bot.start()
-            bot_info = await main_bot.get_me()
-            LOGGER.info(f"Main Bot @{bot_info.username} started.")
-        except FloodWait as e:
-            LOGGER.error(f"Telegram FloodWait on main bot startup. Waiting for {e.value} seconds.")
-            await asyncio.sleep(e.value + 5)
-            await main_bot.start()
-            bot_info = await main_bot.get_me()
-            LOGGER.info(f"Main Bot @{bot_info.username} started after wait.")
+            # If you kept runner in a variable, call runner.cleanup() here.
+            # Attempt to find a runner task by attribute: look for web.AppRunner instances in globals
+            # (If you saved runner in a global earlier, prefer using that.)
+            if 'runner' in globals() and globals().get('runner') is not None:
+                r = globals().get('runner')
+                LOGGER.info("Cleaning up aiohttp runner...")
+                try:
+                    await r.cleanup()
+                except Exception as e:
+                    LOGGER.warning(f"Error during runner cleanup: {e}")
         except Exception as e:
-            LOGGER.critical(f"Failed to start main bot: {e}", exc_info=True)
-            raise
+            LOGGER.debug(f"No web runner to cleanup or cleanup failed: {e}")
 
-        # REMOVED: Backup bot startup logic
-            
-        await initialize_clients()
-        
-        if Config.ON_HEROKU:
-            asyncio.create_task(ping_server())
-
-        # Start cache cleaner background task
-        asyncio.create_task(cache_cleaner_loop())
-        LOGGER.info("Started cache cleaner task.")
-
-        web_app = await web_server()
-        
-        runner = web.AppRunner(web_app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
-        await site.start()
-        LOGGER.info(f"Web server started on port {Config.PORT}.")
-        
+        # 3) Stop all pyrogram clients (main_bot + any additional clients)
         try:
-            await main_bot.send_message(Config.ADMIN_IDS[0], "**✅ Bot has restarted and all services are online!**")
+            LOGGER.info("Stopping pyrogram clients...")
+            stop_tasks = []
+            for cid, c in list(multi_clients.items()):
+                try:
+                    if c and getattr(c, "is_connected", False):
+                        LOGGER.info(f"Stopping client {cid}...")
+                        stop_tasks.append(c.stop())
+                except Exception as e:
+                    LOGGER.warning(f"Error scheduling stop for client {cid}: {e}")
+            if stop_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*stop_tasks, return_exceptions=True), timeout=20)
+                except asyncio.TimeoutError:
+                    LOGGER.warning("Timeout while waiting for pyrogram clients to stop.")
         except Exception as e:
-            LOGGER.warning(f"Could not send startup message: {e}")
-                
-        await asyncio.Event().wait()
+            LOGGER.error(f"Error stopping pyrogram clients: {e}", exc_info=True)
 
-    loop = asyncio.get_event_loop()
+        # 4) Cancel any remaining tasks except current task
+        current_task = asyncio.current_task()
+        remaining = [t for t in asyncio.all_tasks() if t is not current_task]
+        if remaining:
+            LOGGER.info(f"Cancelling {len(remaining)} remaining tasks...")
+            for t in remaining:
+                t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*remaining, return_exceptions=True), timeout=20)
+            except asyncio.TimeoutError:
+                LOGGER.warning("Timeout while waiting for remaining tasks to cancel.")
+            except Exception as e:
+                LOGGER.warning(f"Error while awaiting remaining tasks: {e}")
 
-    async def shutdown_handler(sig):
-        LOGGER.info(f"Received exit signal {sig.name}... shutting down gracefully.")
-        
-        if main_bot and main_bot.is_connected:
-            LOGGER.info("Stopping main bot...")
-            await main_bot.stop()
-        # REMOVED: backup_bot shutdown
-        
-        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-        if tasks:
-            LOGGER.info(f"Cancelling {len(tasks)} outstanding tasks...")
-            [task.cancel() for task in tasks]
-            await asyncio.gather(*tasks, return_exceptions=True)
-        
-        loop.stop()
+        LOGGER.info("Shutdown complete. Stopping event loop.")
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig,
-            lambda s=sig: asyncio.create_task(shutdown_handler(s))
-        )
+    # Signal handler that schedules graceful_shutdown
+    def _signal_handler(sig):
+        LOGGER.info(f"Signal received: {sig.name}")
+        # Schedule graceful_shutdown on the running loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(graceful_shutdown(sig))
+        except RuntimeError:
+            # if no running loop, fallback to calling graceful_shutdown via run_until_complete
+            LOGGER.warning("No running loop to schedule graceful shutdown.")
 
+    # Register signal handlers (works on Unix)
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop = asyncio.get_event_loop()
+            loop.add_signal_handler(s, lambda s=s: _signal_handler(s))
+        except NotImplementedError:
+            # Some platforms (Windows, or certain containers) may not implement add_signal_handler
+            LOGGER.warning("Signal handlers not supported in this environment.")
+
+    # Run the application using asyncio.run to ensure loop lifecycle is managed properly.
     try:
-        LOGGER.info("Application starting up...")
-        loop.run_until_complete(main_startup_shutdown_logic())
-        loop.run_forever()
+        asyncio.run(main_startup_wrapper())
+        # After startup wrapper returns we sleep forever until a shutdown signal triggers graceful_shutdown
+        # Use a long-running waiter which will be cancelled by graceful_shutdown
+        asyncio.run(asyncio.Event().wait())
+    except KeyboardInterrupt:
+        LOGGER.info("KeyboardInterrupt received. Exiting...")
     except Exception as e:
         LOGGER.critical(f"A critical error forced the application to stop: {e}", exc_info=True)
     finally:
-        LOGGER.info("Event loop stopped. Final cleanup.")
-        if loop.is_running():
-            loop.stop()
-        if not loop.is_closed():
-            loop.close()
-        LOGGER.info("Shutdown complete. Goodbye!")
+        LOGGER.info("Exiting main program.")
