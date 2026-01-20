@@ -1,14 +1,15 @@
 # Core Bot Framework
 pyrofork
-TgCrypto
+tgcrypto
 
 # Asynchronous Web Server & HTTP Client
 aiohttp
+aiofiles
 
 # Asynchronous Database Driver
 motor
 dnspython
 
-# Helper Librarie
+# Helper Libraries
 python-dotenv
 psutil
