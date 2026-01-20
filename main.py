@@ -1,3 +1,4 @@
+# main.py - KeralaCaptain Bot - Pure Streaming Engine V4.1 (Modified with caching + disconnect detection)
 import os
 import re
 import math
@@ -8,6 +9,7 @@ import signal
 import asyncio
 import logging
 import aiohttp
+import aiofiles
 import urllib.parse
 import sys
 import psutil # For stats
@@ -24,7 +26,7 @@ from pyrogram import raw
 from pyrogram.raw.types import InputPhotoFileLocation, InputDocumentFileLocation
 
 # -------------------------------------------------------------------------------- #
-# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Cleaned)                         #
+# KeralaCaptain Bot - Pure Streaming Engine V4.1 (Caching + Disconnect Detection)
 # -------------------------------------------------------------------------------- #
 
 # Load configurations from .env file
@@ -71,7 +73,32 @@ if not all(required_vars) or Config.ADMIN_IDS == [0]:
 CURRENT_PROTECTED_DOMAIN = Config.PROTECTED_DOMAIN
 
 # -------------------------------------------------------------------------------- #
-# HELPER FUNCTIONS & CLASSES
+# CACHING / STREAM CONTROL SETTINGS (NEW)
+# -------------------------------------------------------------------------------- #
+
+CACHE_DIR = "./cache"
+CACHE_MAX_AGE_SECONDS = 30 * 60       # 30 minutes
+CACHE_CLEAN_INTERVAL = 10 * 60        # 10 minutes
+CHUNK_SIZE = 1024 * 1024              # constant chunk size (1 MiB) - DO NOT change
+TAIL_SLEEP = 0.12                      # sleep while waiting for more bytes during tailing
+
+# Ensure cache dir exists
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Per-message coordination
+cache_locks = {}        # message_id -> asyncio.Lock()
+cache_events = {}       # message_id -> asyncio.Event()  (set when cache fully written)
+cache_writers = {}      # message_id -> bool (True if writer active)
+cache_writer_tasks = {} # message_id -> task (optional)
+
+# Blocklist regex for download managers (case-insensitive)
+DOWNLOAD_AGENT_PATTERNS = re.compile(
+    r"(idman|internet download manager|adm:|advanced download manager|1dm|solo browser|download manager|getright|flashget|wget|curl)",
+    flags=re.IGNORECASE
+)
+
+# -------------------------------------------------------------------------------- #
+# HELPER FUNCTIONS & CLASSES (Unchanged logic preserved, new helpers added)
 # -------------------------------------------------------------------------------- #
 
 # --- Base64 Encoding/Decoding for Stream URLs (Kept for compatibility) ---
@@ -116,13 +143,24 @@ def get_readable_time(seconds: int) -> str:
     result += f"{seconds}s"
     return result
 
-# -------------------------------------------------------------------------------- #
-# DATABASE OPERATIONS
-# -------------------------------------------------------------------------------- #
+# Safe filename for cache (use message id + original extension)
+def cache_filename_for(message_id: int, original_name: str) -> str:
+    # sanitize extension
+    _, ext = os.path.splitext(original_name or "")
+    if not ext:
+        ext = ".mp4"
+    safe_name = f"{message_id}{ext}"
+    return os.path.join(CACHE_DIR, safe_name)
 
-# ================================================================================ #
-# DATABASE OPERATIONS (Kept original + New Settings)
-# ================================================================================ #
+# Check UA for download manager clients
+def is_blocked_user_agent(ua: str) -> bool:
+    if not ua:
+        return False
+    return bool(DOWNLOAD_AGENT_PATTERNS.search(ua))
+
+# -------------------------------------------------------------------------------- #
+# DATABASE OPERATIONS (UNCHANGED)
+# -------------------------------------------------------------------------------- #
 
 db_client = AsyncIOMotorClient(Config.MONGO_URI)
 db = db_client['KeralaCaptainBotDB']
@@ -135,7 +173,6 @@ media_backup_collection = db['media_backup']
 user_conversations_col = db['conversations']
 # --- NEW: Collection for bot settings ---
 settings_collection = db['settings']
-
 
 # --- Database Functions (Kept original read/write functions for streaming logic) ---
 
@@ -193,7 +230,7 @@ async def get_post_id_from_msg_id(msg_id: int):
     doc = await media_collection.find_one({"message_ids": {"$in": [msg_id]}})
     return doc['wp_post_id'] if doc else None
 
-# --- NEW: Database functions for Domain Settings ---
+# --- NEW: Database functions for Domain Settings (unchanged) ---
 
 async def get_protected_domain() -> str:
     """Fetches the protected domain from settings, returns default if not found."""
@@ -224,13 +261,8 @@ async def set_protected_domain(new_domain: str):
     LOGGER.info(f"Protected domain updated in DB: {new_domain}")
     return new_domain
 
-# ================================================================================ #
-# END OF DATABASE OPERATIONS SECTION
-# ================================================================================ #
-
-
 # -------------------------------------------------------------------------------- #
-# STREAMING ENGINE & WEB SERVER (UNCHANGED CORE LOGIC)
+# STREAMING ENGINE & WEB SERVER (UNCHANGED CORE LOGIC but with caching + drain)
 # -------------------------------------------------------------------------------- #
 
 multi_clients = {}
@@ -241,7 +273,7 @@ next_client_idx = 0
 stream_errors = 0 
 last_error_reset = time.time()
 
-# Upgraded ByteStreamer (Kept As Is)
+# Upgraded ByteStreamer (Kept As Is, unchanged except minor logging)
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client: Client = client
@@ -327,6 +359,11 @@ class ByteStreamer:
             return InputDocumentFileLocation(id=file_id.media_id, access_hash=file_id.access_hash, file_reference=file_id.file_reference, thumb_size=file_id.thumbnail_size)
 
     async def yield_file(self, file_id: FileId, offset: int, chunk_size: int, message_id: int):
+        """
+        Async generator that yields bytes chunks from Telegram using media session.
+        The logic here is the same as original V4.1; callers must handle cancellation
+        and closing the async generator to stop the download immediately.
+        """
         media_session = await self.generate_media_session(file_id)
         location = self.get_location(file_id)
 
@@ -392,6 +429,10 @@ class ByteStreamer:
                 await asyncio.sleep(e.value)
                 continue
 
+# -------------------------------------------------------------------------------- #
+# ROUTES
+# -------------------------------------------------------------------------------- #
+
 routes = web.RouteTableDef()
 
 @routes.get("/", allow_head=True)
@@ -406,14 +447,16 @@ async def health_handler(request):
         last_error_reset = time.time()
     active_sessions = len(multi_clients)
     cache_size = 0
-    if multi_clients:
-        sample_client = list(multi_clients.values())[0]
-        if sample_client in class_cache:
-            cache_size = len(class_cache[sample_client].cached_file_ids)
+    # provide a simple cached files count
+    try:
+        cache_files = os.listdir(CACHE_DIR)
+        cache_size = len([f for f in cache_files if os.path.isfile(os.path.join(CACHE_DIR, f))])
+    except Exception:
+        cache_size = 0
     return web.json_response({
         "status": "ok",
         "active_clients": active_sessions,
-        "cache_size": cache_size,
+        "cache_files": cache_size,
         "stream_errors_last_min": stream_errors,
         "workloads": work_loads,
     })
@@ -424,23 +467,36 @@ async def favicon_handler(request):
 
 @routes.get(r"/stream/{message_id:\d+}")
 async def stream_handler(request: web.Request):
+    """
+    Main streaming handler.
+    - Blocks download-managers by User-Agent.
+    - Enforces Referer check using CURRENT_PROTECTED_DOMAIN.
+    - Uses disk cache (./cache/) to serve repeated requests without Telegram bandwidth.
+    - If cache missing, first requester downloads from Telegram and writes to disk while streaming.
+    - Calls await resp.drain() after every chunk to detect disconnects and stop Telegram download immediately.
+    """
     client_index = None 
+    message_id = None
     try:
-        # --- MODIFIED: Referer Check ---
+        # --- Referer Check (unchanged logic) ---
         referer = request.headers.get('Referer')
-        
-        # Use the dynamic domain from the global variable
         allowed_referer = CURRENT_PROTECTED_DOMAIN 
 
         if not referer or not referer.startswith(allowed_referer):
             LOGGER.warning(f"Blocked hotlink attempt. Referer: {referer}. Allowed: {allowed_referer}")
             return web.Response(status=403, text="403 Forbidden: Direct access is not allowed.")
-            
-        # --- END OF MODIFICATION ---
+        
+        # --- Block download manager User-Agents ---
+        ua = request.headers.get("User-Agent", "")
+        if is_blocked_user_agent(ua):
+            LOGGER.warning(f"Blocked download-manager UA: {ua}")
+            return web.Response(status=403, text="403 Forbidden: Download managers are not allowed.")
 
+        # Parse message_id and Range header
         message_id = int(request.match_info['message_id'])
-        range_header = request.headers.get("Range", 0)
+        range_header = request.headers.get("Range", None)
 
+        # --- Client selection / load balancing (unchanged) ---
         min_load = min(work_loads.values())
         candidates = [cid for cid, load in work_loads.items() if load == min_load]
         
@@ -458,51 +514,337 @@ async def stream_handler(request: web.Request):
             class_cache[faster_client] = ByteStreamer(faster_client)
         tg_connect = class_cache[faster_client]
 
+        # Get file properties from Telegram (cached in ByteStreamer)
         file_id = await tg_connect.get_file_properties(message_id)
         file_size = file_id.file_size
+        original_name = getattr(file_id, "file_name", f"{message_id}.mp4")
 
+        # Range parsing
         from_bytes = 0
         if range_header:
-            from_bytes_str, _ = range_header.replace("bytes=", "").split("-")
-            from_bytes = int(from_bytes_str)
+            # Example: Range: bytes=12345-
+            try:
+                from_bytes_str, _ = range_header.replace("bytes=", "").split("-")
+                from_bytes = int(from_bytes_str) if from_bytes_str else 0
+            except Exception:
+                return web.Response(status=400, text="Bad Range header")
 
         if from_bytes >= file_size:
             return web.Response(status=416, reason="Range Not Satisfiable")
 
-        chunk_size = 1024 * 1024
-        offset = from_bytes - (from_bytes % chunk_size)
+        offset = from_bytes - (from_bytes % CHUNK_SIZE)
         first_part_cut = from_bytes - offset
-        
+
+        # Prepare headers (force inline + cache-control as requested)
         cors_headers = { 'Access-Control-Allow-Origin': allowed_referer }
-        
-        resp = web.StreamResponse(
-            status=206 if range_header else 200,
-            headers={
-                "Content-Type": file_id.mime_type,
-                "Content-Range": f"bytes {from_bytes}-{file_size - 1}/{file_size}",
-                "Content-Length": str(file_size - from_bytes),
-                "Accept-Ranges": "bytes",
-                **cors_headers
-            }
-        )
+        cd_header = f'inline; filename="{urllib.parse.quote_plus(original_name)}"'
+        base_headers = {
+            "Content-Type": file_id.mime_type,
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": cd_header,
+            "Cache-Control": "private, max-age=3600",
+            **cors_headers
+        }
+
+        # Content-Range and Content-Length must be set for partial responses
+        content_length = str(file_size - from_bytes)
+        if range_header:
+            base_headers["Content-Range"] = f"bytes {from_bytes}-{file_size - 1}/{file_size}"
+            base_headers["Content-Length"] = content_length
+            status_code = 206
+        else:
+            base_headers["Content-Length"] = content_length
+            status_code = 200
+
+        resp = web.StreamResponse(status=status_code, headers=base_headers)
         await resp.prepare(request)
 
-        # Auto-refresh logic is inside yield_file
-        body_generator = tg_connect.yield_file(file_id, offset, chunk_size, message_id)
+        # Determine cache filename
+        cache_path = cache_filename_for(message_id, original_name)
 
-        is_first_chunk = True
-        async for chunk in body_generator:
+        # Helper: get or create lock/event for this message
+        if message_id not in cache_locks:
+            cache_locks[message_id] = asyncio.Lock()
+        if message_id not in cache_events:
+            cache_events[message_id] = asyncio.Event()
+        if message_id not in cache_writers:
+            cache_writers[message_id] = False
+
+        # If cache exists AND fully written (event set) -> serve directly from disk (fast path)
+        if os.path.exists(cache_path) and cache_events[message_id].is_set():
+            LOGGER.info(f"Serving {message_id} from cache (fully available).")
+            # Stream from disk supporting Range reads
+            async with aiofiles.open(cache_path, mode='rb') as f:
+                await f.seek(from_bytes)
+                bytes_sent = 0
+                while True:
+                    chunk = await f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    try:
+                        # If first chunk and first_part_cut present, slice it
+                        if bytes_sent == 0 and first_part_cut > 0:
+                            chunk_to_write = chunk[first_part_cut:]
+                        else:
+                            chunk_to_write = chunk
+                        await resp.write(chunk_to_write)
+                        await resp.drain()
+                        bytes_sent += len(chunk_to_write)
+                    except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
+                        LOGGER.warning(f"Client disconnected during cached streaming of {message_id}: {e}")
+                        return resp
+            return resp
+
+        # If cache file exists but writer is active OR cache doesn't exist, we may need to stream while tailing or create writer
+        # Acquire lock: only one writer should perform Telegram download -> others will tail the file
+        lock = cache_locks[message_id]
+        # If lock is free, current requester will try to become writer; otherwise it will tail-read
+        became_writer = False
+        if not lock.locked():
+            await lock.acquire()
+            became_writer = True
+            cache_writers[message_id] = True
+            cache_events[message_id].clear()
+            LOGGER.info(f"Acquired writer lock for message {message_id}")
+        else:
+            # Another writer exists; we will tail-read from disk as it is being written
+            LOGGER.info(f"Another writer is active for {message_id}; tailing from cache file while it's written.")
+        
+        # Writer path: we download from Telegram using yield_file and write to disk + stream to client
+        if became_writer:
+            body_generator = tg_connect.yield_file(file_id, offset, CHUNK_SIZE, message_id)
+            tmp_path = cache_path + ".part"
             try:
-                if is_first_chunk and first_part_cut > 0:
-                    await resp.write(chunk[first_part_cut:])
-                    is_first_chunk = False
-                else:
-                    await resp.write(chunk)
-            except (ConnectionError, asyncio.CancelledError):
-                LOGGER.warning(f"Client disconnected while writing chunk for message {message_id}.")
+                async with aiofiles.open(tmp_path, mode='wb') as wf:
+                    is_first_chunk = True
+                    bytes_written = 0
+                    async for chunk in body_generator:
+                        try:
+                            # If first chunk and first_part_cut > 0, write full chunk to disk but slice to client
+                            await wf.write(chunk)
+                            await wf.flush()
+                            bytes_written += len(chunk)
+
+                            # Stream to client (honoring first_part_cut)
+                            if is_first_chunk and first_part_cut > 0:
+                                data_for_client = chunk[first_part_cut:]
+                                is_first_chunk = False
+                            else:
+                                data_for_client = chunk
+
+                            await resp.write(data_for_client)
+                            # CRUCIAL: drain after each write; if this raises, we must stop the Telegram download immediately
+                            try:
+                                await resp.drain()
+                            except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
+                                LOGGER.warning(f"Detected client disconnect while streaming {message_id}. Cancelling download to save bandwidth. Err: {e}")
+                                # Close/stop the async generator to signal yield_file to stop further Telegram requests
+                                try:
+                                    await body_generator.aclose()
+                                except Exception:
+                                    pass
+                                # Close file and delete partial
+                                try:
+                                    await wf.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    if os.path.exists(tmp_path):
+                                        os.remove(tmp_path)
+                                except Exception as ex:
+                                    LOGGER.warning(f"Failed to remove partial cache {tmp_path}: {ex}")
+                                # Reset writer flags, release lock, notify waiting tailers (they should fail)
+                                cache_writers[message_id] = False
+                                cache_events[message_id].clear()
+                                lock.release()
+                                return resp
+
+                        except Exception as write_err:
+                            LOGGER.error(f"Error while writing/streaming chunk for {message_id}: {write_err}", exc_info=True)
+                            # Attempt to stop generator and cleanup
+                            try:
+                                await body_generator.aclose()
+                            except Exception:
+                                pass
+                            try:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            cache_writers[message_id] = False
+                            cache_events[message_id].clear()
+                            lock.release()
+                            raise write_err
+
+                    # Completed writing full file
+                    # Atomically rename .part -> final cache file
+                    try:
+                        await wf.close()
+                    except Exception:
+                        pass
+                os.replace(tmp_path, cache_path)
+                cache_events[message_id].set()
+                LOGGER.info(f"Cache written for message {message_id} -> {cache_path}")
+                cache_writers[message_id] = False
+                lock.release()
                 return resp
 
-        return resp
+            except Exception as e:
+                LOGGER.error(f"Writer encountered error for message {message_id}: {e}", exc_info=True)
+                # Cleanup
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+                cache_writers[message_id] = False
+                cache_events[message_id].clear()
+                if lock.locked():
+                    lock.release()
+                # Re-raise to be handled by outer except
+                raise
+
+        else:
+            # Tail-reading path: cache file might be being created by writer. We open file and read as bytes available.
+            # If file does not yet exist, wait until at least partial appears (but do not wait indefinitely).
+            tail_start = time.time()
+            max_tail_wait = 30  # seconds, reasonable
+            bytes_sent = 0
+            try:
+                # Wait for file to appear (but avoid infinite wait)
+                while not os.path.exists(cache_path):
+                    # If writer aborted (no writer active and no final file), then consider failing
+                    if not cache_writers.get(message_id, False) and not os.path.exists(cache_path):
+                        # No writer, and file not present -> try again briefly, then fallback to attempting to be writer
+                        await asyncio.sleep(0.15)
+                        # small grace; after waiting a bit, attempt to acquire lock to become writer
+                        if not cache_locks[message_id].locked():
+                            # Try to become writer ourselves (race resolution)
+                            await cache_locks[message_id].acquire()
+                            cache_writers[message_id] = True
+                            cache_events[message_id].clear()
+                            became_writer = True
+                            break
+                    if time.time() - tail_start > max_tail_wait:
+                        # fallback: try to become writer if possible
+                        if not cache_locks[message_id].locked():
+                            await cache_locks[message_id].acquire()
+                            cache_writers[message_id] = True
+                            cache_events[message_id].clear()
+                            became_writer = True
+                            break
+                        else:
+                            # writer exists but file still not created, give up after some time
+                            break
+                    await asyncio.sleep(0.12)
+
+                # If we became writer due to race, recursively call stream_handler to take writer path
+                if became_writer:
+                    LOGGER.info(f"Tail-reader promoted to writer for {message_id}")
+                    # release and re-enter writer logic by calling the handler function again (recur)
+                    # To avoid recursion depth, simply call the writer logic inline: create generator and perform same write-stream cycle
+                    body_generator = tg_connect.yield_file(file_id, offset, CHUNK_SIZE, message_id)
+                    tmp_path = cache_path + ".part"
+                    try:
+                        async with aiofiles.open(tmp_path, mode='wb') as wf:
+                            is_first_chunk = True
+                            bytes_written = 0
+                            async for chunk in body_generator:
+                                await wf.write(chunk)
+                                await wf.flush()
+                                bytes_written += len(chunk)
+
+                                if is_first_chunk and first_part_cut > 0:
+                                    data_for_client = chunk[first_part_cut:]
+                                    is_first_chunk = False
+                                else:
+                                    data_for_client = chunk
+
+                                await resp.write(data_for_client)
+                                try:
+                                    await resp.drain()
+                                except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
+                                    LOGGER.warning(f"Detected client disconnect while streaming {message_id} (promoted writer). Cancelling download. Err: {e}")
+                                    try:
+                                        await body_generator.aclose()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await wf.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if os.path.exists(tmp_path):
+                                            os.remove(tmp_path)
+                                    except Exception:
+                                        pass
+                                    cache_writers[message_id] = False
+                                    cache_events[message_id].clear()
+                                    cache_locks[message_id].release()
+                                    return resp
+
+                            try:
+                                await wf.close()
+                            except Exception:
+                                pass
+                        os.replace(tmp_path, cache_path)
+                        cache_events[message_id].set()
+                        cache_writers[message_id] = False
+                        cache_locks[message_id].release()
+                        LOGGER.info(f"Cache written (promoted writer) for message {message_id} -> {cache_path}")
+                        return resp
+
+                    except Exception as e:
+                        LOGGER.error(f"Promoted-writer error for message {message_id}: {e}", exc_info=True)
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        cache_writers[message_id] = False
+                        cache_events[message_id].clear()
+                        if cache_locks[message_id].locked():
+                            cache_locks[message_id].release()
+                        raise
+
+                # Normal tailing: file exists and being written by another writer
+                async with aiofiles.open(cache_path, mode='rb') as rf:
+                    await rf.seek(from_bytes)
+                    while True:
+                        chunk = await rf.read(CHUNK_SIZE)
+                        if chunk:
+                            try:
+                                if bytes_sent == 0 and first_part_cut > 0:
+                                    await resp.write(chunk[first_part_cut:])
+                                    bytes_sent += len(chunk) - first_part_cut
+                                else:
+                                    await resp.write(chunk)
+                                    bytes_sent += len(chunk)
+                                await resp.drain()
+                            except (ConnectionError, asyncio.CancelledError, ClientConnectionError, OSError) as e:
+                                LOGGER.warning(f"Client disconnected while tail-streaming {message_id}: {e}")
+                                return resp
+                        else:
+                            # no new data; if writer still active, wait for more, else end
+                            if cache_writers.get(message_id, False):
+                                await asyncio.sleep(TAIL_SLEEP)
+                                continue
+                            else:
+                                # writer finished but no more bytes
+                                break
+
+                # If we get here we finished tailing
+                return resp
+
+            except Exception as e:
+                LOGGER.error(f"Tail-reader failed for message {message_id}: {e}", exc_info=True)
+                # If we held the lock (unlikely here), release
+                try:
+                    if cache_locks[message_id].locked():
+                        cache_locks[message_id].release()
+                except Exception:
+                    pass
+                raise
 
     except (FileReferenceExpired, AuthBytesInvalid) as e:
         LOGGER.error(f"FATAL STREAM ERROR for {message_id}: {type(e).__name__}. Client needs to refresh.")
@@ -517,11 +859,6 @@ async def stream_handler(request: web.Request):
             work_loads[client_index] -= 1
             LOGGER.debug(f"Decremented workload for client {client_index}. Current workloads: {work_loads}")
 
-async def web_server():
-    web_app = web.Application(client_max_size=30_000_000)
-    web_app.add_routes(routes)
-    return web_app
-            
 # -------------------------------------------------------------------------------- #
 # BOT & CLIENT INITIALIZATION (CLEANED)
 # -------------------------------------------------------------------------------- #
@@ -584,7 +921,7 @@ async def forward_file_safely(message_to_forward: Message):
         return None
 
 # -------------------------------------------------------------------------------- #
-# NEW BOT HANDLERS (ADMIN ONLY)
+# NEW BOT HANDLERS (ADMIN ONLY) - unchanged
 # -------------------------------------------------------------------------------- #
 
 # --- NEW: Admin filter ---
@@ -745,6 +1082,37 @@ async def text_message_handler(client, message: Message):
 
 
 # -------------------------------------------------------------------------------- #
+# CACHE CLEANER TASK
+# -------------------------------------------------------------------------------- #
+
+async def cache_cleaner_loop():
+    """Runs every CACHE_CLEAN_INTERVAL seconds and deletes files older than CACHE_MAX_AGE_SECONDS."""
+    while True:
+        try:
+            now = time.time()
+            for fn in os.listdir(CACHE_DIR):
+                fpath = os.path.join(CACHE_DIR, fn)
+                try:
+                    if not os.path.isfile(fpath):
+                        continue
+                    mtime = os.path.getmtime(fpath)
+                    age = now - mtime
+                    # Remove .part files older than a grace (they indicate failed writes)
+                    if fn.endswith(".part"):
+                        if age > 60: # remove partials older than 1 minute
+                            os.remove(fpath)
+                            LOGGER.info(f"Removed stale partial cache file: {fpath}")
+                        continue
+                    if age > CACHE_MAX_AGE_SECONDS:
+                        os.remove(fpath)
+                        LOGGER.info(f"Removed cache file older than {CACHE_MAX_AGE_SECONDS}s: {fpath}")
+                except Exception as e:
+                    LOGGER.warning(f"Error while cleaning cache file {fpath}: {e}")
+        except Exception as e:
+            LOGGER.error(f"Cache cleaner loop error: {e}", exc_info=True)
+        await asyncio.sleep(CACHE_CLEAN_INTERVAL)
+
+# -------------------------------------------------------------------------------- #
 # APPLICATION LIFECYCLE (CLEANED)
 # -------------------------------------------------------------------------------- #
 
@@ -796,7 +1164,11 @@ if __name__ == "__main__":
         
         if Config.ON_HEROKU:
             asyncio.create_task(ping_server())
-        
+
+        # Start cache cleaner background task
+        asyncio.create_task(cache_cleaner_loop())
+        LOGGER.info("Started cache cleaner task.")
+
         web_app = await web_server()
         
         runner = web.AppRunner(web_app)
